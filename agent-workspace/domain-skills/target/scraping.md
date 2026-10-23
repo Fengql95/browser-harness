@@ -28,8 +28,8 @@ if not re.fullmatch(r"https://www\.target\.com/c/[^?#]+/-/N-[0-9A-Za-z]+", CATEG
 LISTING = "/redsky_aggregations/v1/web/plp_search_v2"
 SUMMARY = "/redsky_aggregations/v1/web/product_summary_with_fulfillment_v1"
 
-def blocked(status):
-    return (f"Target answered the category page's own listing request with HTTP {status} "
+def blocked(status, what="listing"):
+    return (f"Target answered the category page's own {what} request with HTTP {status} "
             "(PerimeterX returns 435). Stop and back off; do not retry or try to solve the captcha.")
 
 def body(session, request_id):
@@ -68,8 +68,7 @@ def read_page(session, timeout=30):
             elif m == "Network.loadingFinished":
                 r = reqs[p["requestId"]]
                 if r.get("status") != 200:
-                    raise SystemExit(blocked(r.get("status")) if r["kind"] == "listing"
-                                     else f"fulfillment request HTTP {r.get('status')}")
+                    raise SystemExit(blocked(r.get("status"), "listing" if r["kind"] == "listing" else "fulfillment"))
                 data = body(session, p["requestId"])["data"]
                 if r["kind"] == "listing":
                     listing = data["search"]
@@ -109,14 +108,22 @@ def parse(p, f):
         "sponsored": bool(p.get("is_sponsored_sku")),
     }
 
+def is_blank(url):   # the same blank-tab cases browser-harness's own new_tab() reuses
+    url = url or ""
+    return (url in ("", "about:blank", "data:text/html,") or url.startswith("about:blank#")
+            or url.startswith(("chrome://newtab", "chrome://new-tab-page", "edge://newtab", "about:newtab")))
+
 try:
     cur = current_tab()
 except Exception:
     cur = {}
-tab = cur.get("targetId") if cur.get("url") in ("", "about:blank") else new_tab()   # reuse a blank tab
-session = switch_tab(tab)     # its CDP session id; read_page ignores events from any other tab
-rows, seen, meta = [], set(), {}
+rows, seen, meta, tab = [], set(), {}, None
 try:
+    if cur.get("targetId") and is_blank(cur.get("url")):
+        tab = cur.get("targetId")   # reuse the blank tab
+    else:   # what new_tab() does, but the id is known before attaching, so finally can close it
+        tab = cdp("Target.createTarget", url="about:blank", background=True)["targetId"]
+    session = switch_tab(tab)     # its CDP session id; read_page ignores events from any other tab
     for page in range(MAX_PAGES):
         if page:
             time.sleep(3)   # polite pacing between page loads
@@ -139,7 +146,8 @@ try:
         if meta.get("current_page", 0) >= (meta.get("total_pages") or 0):
             break
 finally:
-    close_tab(tab)
+    if tab:
+        close_tab(tab)
 
 print("total_results:", meta.get("total_results"))
 print(json.dumps(rows[:2], indent=1))
@@ -237,10 +245,10 @@ Observed output (trimmed):
  "upc": "810002864582",
  "category_path": ["Kitchen & Dining", "Kitchen Appliances", "Fryers", "Air Fryers"],
  "rating": 4.07,
- "rating_count": 2296,
- "review_count": 1017,
+ "rating_count": 2297,
+ "review_count": 1018,
  "question_count": 242,
- "rating_distribution": {"rating1": 379, "rating2": 108, "rating3": 73, "rating4": 153, "rating5": 1583},
+ "rating_distribution": {"rating1": 379, "rating2": 108, "rating3": 73, "rating4": 153, "rating5": 1584},
  "highlights": ["6-QT capacity can cook family staples and party favorites for a variety of crowds", ...],
  "specs": ["Dimensions (Overall): 13.58 Inches (H) x 14.05 Inches (W) x 11.46 Inches (D)", "Weight: 12.1 Pounds", ...],
  "description": "Check on your food at-a-glance with the Gourmia 6-QT. Digital Window Air Fryer. ..."
@@ -259,46 +267,47 @@ ALLOW_FOREGROUND = False   # opt-in: True lets this block bring the tab to the f
 
 URL = f"https://www.target.com/p/-/A-{TCIN}"
 
-tab = new_tab()
-before = js("location.href")
-goto_url(URL)
-deadline = time.time() + 15
-while (href := js("location.href")) != URL:   # confirm the tab really is on the requested page before reading it
-    if time.time() > deadline:
-        close_tab(tab)
-        raise SystemExit(f"asked for {URL} (tab was on {before}), tab is on {href}")
-    time.sleep(0.2)
-wait_for_load()
+# what new_tab() does, but the id is known before attaching, so finally can close it
+tab = cdp("Target.createTarget", url="about:blank", background=True)["targetId"]
+try:
+    switch_tab(tab)
+    before = js("location.href")
+    goto_url(URL)
+    deadline = time.time() + 15
+    while (href := js("location.href")) != URL:   # confirm the tab really is on the requested page before reading it
+        if time.time() > deadline:
+            raise SystemExit(f"asked for {URL} (tab was on {before}), tab is on {href}")
+        time.sleep(0.2)
+    wait_for_load()
 
-# Price and fulfillment are deferred modules, filled after load by
-# www.target.com/cdui_orchestrations/v1/pages/pdp/deferred_enrichment/modules
-# They stay a grey placeholder while the tab is hidden (document.visibilityState == "hidden").
-live = {}
-for i in range(20):
-    live = js("""(() => {
-      const t = s => (document.querySelector(s)?.innerText || '').trim();
-      return {
-        visibility: document.visibilityState,
-        title: t('[data-test="product-title"]'),
-        price_block: t('[data-test="module-product-detail-price-v2"]'),
-        fulfillment: t('[data-test="module-product-detail-fulfillment-v1"]'),
-        rating_block: t('[data-test="ratingFeedbackContainer"]'),
-      };
-    })()""")
-    if live["price_block"] and live["fulfillment"]:
-        break
-    if i == 5 and live["visibility"] == "hidden":
-        if not ALLOW_FOREGROUND:
-            close_tab(tab)
-            raise SystemExit("tab is hidden and the price/fulfillment modules did not render; "
-                             "set ALLOW_FOREGROUND = True to bring it to the front")
-        activate_tab(current_tab())
-    time.sleep(1)
-else:
+    # Price and fulfillment are deferred modules, filled after load by
+    # www.target.com/cdui_orchestrations/v1/pages/pdp/deferred_enrichment/modules
+    # They stay a grey placeholder while the tab is hidden (document.visibilityState == "hidden").
+    live = {}
+    for i in range(20):
+        live = js("""(() => {
+          const t = s => (document.querySelector(s)?.innerText || '').trim();
+          return {
+            visibility: document.visibilityState,
+            title: t('[data-test="product-title"]'),
+            price_block: t('[data-test="module-product-detail-price-v2"]'),
+            fulfillment: t('[data-test="module-product-detail-fulfillment-v1"]'),
+            rating_block: t('[data-test="ratingFeedbackContainer"]'),
+          };
+        })()""")
+        if live["price_block"] and live["fulfillment"]:
+            break
+        if i == 5 and live["visibility"] == "hidden":
+            if not ALLOW_FOREGROUND:
+                raise SystemExit("tab is hidden and the price/fulfillment modules did not render; "
+                                 "set ALLOW_FOREGROUND = True to bring it to the front")
+            activate_tab(current_tab())
+        time.sleep(1)
+    else:
+        raise SystemExit(f"price/fulfillment modules did not render in 20 s: {json.dumps(live)}")
+    print(json.dumps(live, indent=1))
+finally:
     close_tab(tab)
-    raise SystemExit(f"price/fulfillment modules did not render in 20 s: {json.dumps(live)}")
-print(json.dumps(live, indent=1))
-close_tab(tab)
 ```
 
 Observed output (store name trimmed):
@@ -308,8 +317,8 @@ Observed output (store name trimmed):
  "visibility": "visible",
  "title": "Gourmia 6qt Digital Window Air Fryer with 12 Presets & Guided Cooking Black: Stainless Steel, 1-Year Warranty",
  "price_block": "$59.99 reg $69.99\n$10 off",
- "fulfillment": "Pickup\nReady within 2 hours\nDelivery\nAs soon as 3pm today\nShipping\nArrives by Sun, Oct 25\nPickup at <nearest store>\nOnly 1 left\nAlways free\nChange",
- "rating_block": "4.07 out of 5 stars\n2,296\n242 Questions"
+ "fulfillment": "Pickup\nReady within 2 hours\nDelivery\nAs soon as 8pm today\nShipping\nArrives by Wed, Oct 28\nPickup at <nearest store>\nReady within 2 hours\nAlways free\nChange",
+ "rating_block": "4.07 out of 5 stars\n2,297\n242 Questions"
 }
 ```
 
@@ -347,9 +356,9 @@ Product page (`ProductDetailWebDatasourceCore.module_data.data.product`, block 2
 - **Hidden tabs.** Block 1 also worked in a background tab (`visibilityState` `hidden`) for Air Fryers, so it does not need to bring the tab to the front.
 - **Sponsored slots.** The first pages hold 30 products for `count=24`; the 6 extras are sponsored (`is_sponsored_sku: true`), and some repeat an organic TCIN on the same page. The block drops sponsored rows and dedupes by TCIN, and stops at `total_pages` or an empty page.
 - **Results depend on location.** The store, pickup status and some prices come from the store Target picks for the browser's IP (`store_ids`, `zip` in the listing URL). In one cloud session the store was in New York and 266 of 270 air fryer rows were pickup `UNAVAILABLE`; another session got `IN_STOCK` for the first row.
-- **A fresh browser can be blocked on its very first page load.** In 2 of 6 fresh cloud browser sessions on 2026-10-23 the category page's own `plp_search_v2` request got HTTP 435 (PerimeterX) on the first load, with no earlier requests, and block 1 stopped with its block message. Back off; do not retry in that session or try to solve the captcha. Both times a new session started 5 to 6 minutes later ran all blocks without a block.
+- **A fresh browser can be blocked on its very first page load.** On 2026-10-23, 6 of 11 fresh cloud browser sessions got HTTP 435 (PerimeterX) on the category page's first load, with no earlier requests: 5 on its own `plp_search_v2` request (block 1 stops with its block message) and 1 on `product_summary_with_fulfillment_v1` (block 1 stops with `fulfillment request HTTP 435`). Back off; do not retry in that session or try to solve the captcha. Twice a new session started 5 to 6 minutes later ran all blocks. Another time 4 sessions in a row were blocked, with waits of about 5, 10 and 15 minutes between them, and a fifth, about 20 minutes after the fourth, ran blocks 1 and 3. Block 2 (plain HTTP) still returned 200 from the first of those blocked sessions.
 - **Pacing.** Block 1 waits 3 s between page loads. In unblocked sessions on 2026-10-23, about 30 category page loads (including one 12-page walk) produced no 429 and no new block; heavier rates were not tested.
-- **Tabs.** Block 1 uses the current tab if it is blank (otherwise a new tab) and closes it in `finally`; block 3 opens and closes its own tab. When block 1 left an extra blank tab open, block 3's new background tab stayed `hidden` and stopped with its `ALLOW_FOREGROUND` message. Closing the last tab left the cloud browser with 0 tabs, and the next `new_tab()` still worked. Once, with three tabs open, `goto_url` for page 2 raised `Page.navigate timed out after 5s`; it did not recur with one tab.
+- **Tabs.** Block 1 reuses the current tab if it is blank (the same URLs browser-harness's `new_tab()` treats as blank: empty, `about:blank`, `about:blank#...`, `data:text/html,`, and the Chrome/Edge new tab pages), otherwise it creates a background tab the way `new_tab()` does; block 3 always creates its own. Both take the tab id before attaching and close the tab in `finally`, so an error at any step after creation still closes it. In fresh cloud browsers on 2026-10-23, `list_tabs()` showed 0 open tabs after block 1 stopped on a 435 and after block 3 finished. When block 1 left an extra blank tab open, block 3's new background tab stayed `hidden` and stopped with its `ALLOW_FOREGROUND` message. Closing the last tab left the cloud browser with 0 tabs, and the next `new_tab()` still worked. Once, with three tabs open, `goto_url` for page 2 raised `Page.navigate timed out after 5s`; it did not recur with one tab.
 - **Hidden tabs do not render the PDP price.** In a background tab the price module stayed a placeholder (`data-test="price-module-placeholder"`) and `visibilityState` was `hidden`; `activate_tab(current_tab())` fixed it. Block 3 does that only with `ALLOW_FOREGROUND = True` because it visibly switches tabs; otherwise it stops with a message. In a cloud browser with only this tab open, the new tab was already `visible` and rendered the price without it.
 - **DOM selectors (fallback).** Category cards were `[data-test="@web/site-top-of-funnel/ProductCardWrapper"]` (30 on Air Fryers page 1 on desktop) and the pager `[data-test="listing-page-pagination"]` read `page 1 of 12`. Prefer the JSON.
 - No cookie/consent banner blocked anything on www.target.com from a US exit IP.

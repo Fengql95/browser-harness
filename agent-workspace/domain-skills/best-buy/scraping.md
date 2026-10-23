@@ -163,6 +163,10 @@ def load_search_page(query, page, deadline):
     cards = safe_js(EXTRACT_CARDS, deadline=deadline)
     if not cards:
         raise NotReady("no product cards could be read")
+    # A card shell that never hydrated has a SKU but no h3 or link; sponsored cards render both too.
+    shells = [c["sku"] for c in cards if not (c["sku"] and c["title"] and c["url"])]
+    if shells:
+        raise NotReady(f"{len(shells)} of {len(cards)} cards still lack SKU, title or URL: {shells[:5]}")
     # listResult.count is sometimes {} and searchResultsNum is "" or a numeric string: accept numbers only
     meta = safe_js("""(() => {
       const num = v => (v === '' || v === null || v === undefined || typeof v === 'object') ? null
@@ -232,31 +236,31 @@ for item in all_items[:3]:
 Real output (trimmed, 2026-10-23, latest fresh-browser run):
 
 ```
-page 1 (site says page 1): 24 cards, 20 new, 24 priced, total results 1232
+page 1 (site says page 1): 24 cards, 23 new, 24 priced, total results 1233
 page 2 (site says page 2): 24 cards, 19 new, 24 priced, total results 1235
-page 3 (site says page 3): 24 cards, 19 new, 24 priced, total results 1235
-page 4 (site says page 4): 24 cards, 18 new, 24 priced, total results 1235
-page 5 (site says page 5): 24 cards, 23 new, 24 priced, total results 1235
+page 3 (site says page 3): 24 cards, 22 new, 24 priced, total results 1235
+page 4 (site says page 4): 24 cards, 24 new, 24 priced, total results 1235
+page 5 (site says page 5): 24 cards, 24 new, 24 priced, total results 1235
 stopped after page 5: robots.txt disallows cp=6 to cp=20 for User-agent: *, so the rest of the 1235 results are not fetched
-99 unique products; Counter({'in_stock': 96, 'shop open-box': 2, 'sold_out': 1})
-{"sku": "6623881", "title": "HP - Victus 15.6\" 144Hz Full HD Gaming Laptop - AMD Ryzen 7 7445HS (2023) - 16GB Memory - NVIDIA GeForce RTX 4050 - 512GB SSD - Mica Silver",
- "url": "https://www.bestbuy.com/product/hp-victus-15-6-144hz-full-hd-gaming-laptop-amd-ryzen-7-7445hs-2023-16gb-memory-nvidia-geforce-rtx-4050-512gb-ssd-mica-silver/JJGH2L8JVV",
- "price": 949.99, "regular_price": 1474.99, "on_sale": true, "savings": "Save $525", "rating": 4.7, "review_count": 1421,
- "availability": "in_stock", "button": "Add to cart", "pickup": "Pick up Thu, Oct 29", "shipping": "Get it by Tue, Oct 27 \u2022 FREE",
- "sponsored": false, "page": 1}
+112 unique products; Counter({'in_stock': 110, 'sold_out': 1, 'unavailable': 1})
+{"sku": "6687893", "title": "HP - Googlebook 14\" 3K OLED Touchscreen - Snapdragon X Elite - 16GB Memory - 512GB SSD - Atmospheric Blue",
+ "url": "https://www.bestbuy.com/product/hp-googlebook-14-3k-oled-touchscreen-snapdragon-x-elite-16gb-memory-512gb-ssd-atmospheric-blue/J3PPHVH9QX/sku/6687893",
+ "price": 1299, "regular_price": null, "on_sale": false, "savings": null, "rating": 4.5, "review_count": 33,
+ "availability": "in_stock", "button": "Add to cart", "pickup": "Pick up in 1 hour", "shipping": "Get it tomorrow \u2022 FREE",
+ "sponsored": true, "page": 1}
 ```
 
-An earlier run of the same crawl gave 104 unique products (`in_stock` 102, `sold_out` 1, `unavailable` 1).
+Earlier runs of the same crawl gave 99 and 104 unique products. Every card on all 5 pages, the 6 sponsored ones per page included, had a SKU, title and URL, so the block's card-shell check passed.
 
 So 5 pages give about 100 unique products; the other ~1,100 results sit on pages robots.txt disallows for `User-agent: *` (`cp=6` to `cp=20`). The permitted crawl of a query is capped at those 5 pages; for more, use the official API (see "What does not work"). Page 1 has no `cp` in the URL; the block checks that the page the site reports (`dioPageData.listPageNum`, else `listResult.pageNumber`) matches the page it asked for and raises if not, and it also raises when the site reports no page number or result count. Without `cp`, Best Buy rendered page 1 (`listPageNum` 1, the only pagination link pointing to `cp=2`), and `cp=2` shared 3 of about 20 SKUs with it, in line with the cross-page repeats noted under Gotchas.
 
 How the block ends and fails:
 
 - **Short result sets end on the count.** Best Buy pages 18 organic results at a time (`gaming laptop` pages 1, 2 and 5 each had 24 cards, 6 of them sponsored; 1,236 results gave a last-page link of 69, which is 1,236 / 18 rounded up). After each page the block stops once the page number reaches the reported total / 18, rounded up, so it never requests a page past the end. For `rtx 5090 founders edition` that is page 2 (`cp=2` reported 28 results in one run, 30 in another); `cp=3` there showed "unable to display products" with 0 cards.
-- **Anything else is an error, not the end.** "Unable to display products", no rendered titles, no readable cards, or a missing page number or count on a page the count says exists fails that attempt. Each page gets one 120 s deadline covering all attempts and backoffs (15 s, then 30 s); a retry starts only if at least 40 s would remain after its backoff, so the last attempt is followed by a raise, not a sleep. The error says the results so far are incomplete.
+- **Anything else is an error, not the end.** "Unable to display products", no rendered titles, no readable cards, any card still missing its SKU, title or URL after the revisit passes, or a missing page number or count on a page the count says exists fails that attempt. Each page gets one 120 s deadline covering all attempts and backoffs (15 s, then 30 s); a retry starts only if at least 40 s would remain after its backoff, so the last attempt is followed by a raise, not a sleep. The error says the results so far are incomplete.
 - **Blocks are not retried.** Before reading a page, `nav()` records the tab's URL, waits until the tab is on a new document whose `location.href` is the requested URL (Best Buy may add `id=pcat17071` and reorder parameters, so `st` and `cp` are compared), and raises at once on HTTP 403 or 429 instead of retrying. Normal pages reported 200.
 
-Counts vary run to run: an earlier run of pages 1-3 had 20 of 24 cards priced on page 1, and in another fresh-browser run page 1 came back with 14 of 24 priced and 9 cards that never rendered at all (`title` and `url` also `null`), even after the 3 revisit passes. Check the `priced` count per page. "Unavailable" and "Sold Out" cards still carry a price once they scroll into view: on an `rtx 5090` search, all 5 "Unavailable" cards on pages 1-3 had a price (e.g. $1,799.99, $799.99). `price` is `null` only when a card never rendered its price block.
+Counts vary run to run: an earlier run of pages 1-3 had 20 of 24 cards priced on page 1, and in another fresh-browser run page 1 came back with 14 of 24 priced and 9 cards that never rendered at all (`title` and `url` also `null`), even after the 3 revisit passes. The block now treats a page with any such card shell as not ready, so it reloads that page within the page's 120 s deadline and raises if the shells persist. A card whose price block alone never rendered is kept with `price: null`, so check the `priced` count per page. "Unavailable" and "Sold Out" cards still carry a price once they scroll into view: on an `rtx 5090` search, all 5 "Unavailable" cards on pages 1-3 had a price (e.g. $1,799.99, $799.99). `price` is `null` only when a card never rendered its price block.
 
 ### Search result fields
 
@@ -474,10 +478,10 @@ for sku in skus[:12]:
         break
 ```
 
-Real output (trimmed, 2026-10-23):
+Real output (trimmed, 2026-10-23, latest fresh-browser run):
 
 ```
-organic SKUs on page: ['6667483', '13214744', '12341769', '6673811', '6667482']
+organic SKUs on page: ['6667483', '12756229', '12341769', '6667482', '6681674']
 6667483 on_sale True price 209.99 price block 209.99 regular 349.99 price_type onSale
 {
  "sku": "6667483",
@@ -493,17 +497,17 @@ organic SKUs on page: ['6667483', '13214744', '12341769', '6673811', '6667482']
 {"Key Specs": {"Screen Type": "TN", "Screen Size": "14 inches", "Processor Model": "Intel Processor N150", ...},
  "General": {"Brand": "HP", "Model Number": "14-dq6105dx", "Color": "Pale Rose Gold", "Year of Release": "2026"},
  "Display": {"Display Type": "LED", "Screen Size": "14 inches", "Refresh Rate": "60Hz", "Brightness": "250 nits", ...}}
-13214744 on_sale True price 337 price block 337 regular 399.99 price_type None
+12756229 on_sale True price 337 price block 337 regular 399.99 price_type onSale
 12341769 on_sale True price 829 price block 829 regular 1199.99 price_type onSale
-6673811 on_sale True price 199 price block 199 regular 419 price_type onSale
 6667482 on_sale True price 199.99 price block 199.99 regular 349.99 price_type onSale
+6681674 on_sale True price 539.99 price block 539.99 regular 699.99 price_type onSale
 6615874 on_sale False price 699 price block 699 regular None price_type regular
 {
  "sku": "6615874",
  "title": "Apple - MacBook Neo 13-inch Laptop - A18 Pro chip with 6‑core CPU and 5‑core GPU - 8GB Memory - 256GB SSD - Indigo",
  "brand": "Apple", "model": "MHFF4LL/A",
  "price": 699, "price_block_price": 699, "regular_price": null, "on_sale": false,
- "availability": "InStock", "price_type": "regular", "button_state": "ADD_TO_CART", "rating": 4.9, "review_count": 1465, ...
+ "availability": "InStock", "price_type": "regular", "button_state": "ADD_TO_CART", "rating": 4.9, "review_count": 1470, ...
 }
 52 spec rows in 16 sections
 ...
@@ -520,7 +524,7 @@ organic SKUs on page: ['6667483', '13214744', '12341769', '6673811', '6667482']
 | `other_offers` | other JSON-LD `offers[]` | Open-Box Excellent / Good / Fair |
 | `price_block_price`, `regular_price` | `[data-testid="price-block-customer-price"]` and `[data-testid="price-block-regular-price"]` inside the main product's `[data-testid="bestbuy-price-ui-price-experience"] [data-testid="price-block"]` | `regular_price` (the main block's "Comp. Value: $419.00" line) is `None` when the main product is not discounted. `price_block_price` matched JSON-LD `price` on all 6 laptops checked. Never read these test ids page-wide: warranty, sponsored, "consider" and other product carousels reuse them, and on the undiscounted $699.00 MacBook the first page-wide match was another card's "The price was $419.00". The container appears twice (top and a lower duplicate), both for the main product |
 | `on_sale` | `regular_price` present and above `price_block_price` | Works even when `price_type` is `None` |
-| `price_type`, `button_state` | `window._BBY_DATA_.skus` entry with `isPDP: true` and a non-null `priceType` (`priceType`, `primaryButtonState`) | Hydrates 10-20 s after JSON-LD, and a second `isPDP` entry with `priceType: null` can show up. On 1 of 6 laptops (`13214744`) it never hydrated within the 45 s wait, so both are `None`. Same entry has `unitPrice`, `altSellerPriceMin/Max`, `userGeneratedContent.ratingAverage/reviewsCount` |
+| `price_type`, `button_state` | `window._BBY_DATA_.skus` entry with `isPDP: true` and a non-null `priceType` (`priceType`, `primaryButtonState`) | Hydrates 10-20 s after JSON-LD, and a second `isPDP` entry with `priceType: null` can show up. In an earlier run, on 1 of 6 laptops (`13214744`) it never hydrated within the 45 s wait, so both were `None`; in the latest run all 7 laptops hydrated. Same entry has `unitPrice`, `altSellerPriceMin/Max`, `userGeneratedContent.ratingAverage/reviewsCount` |
 | `rating`, `review_count` | JSON-LD `aggregateRating.ratingValue` / `reviewCount` | |
 | `specs` | "See all specifications" sheet `[data-testid="brix-sheet-content"]`: each `h3` is a section, each direct child `div` is a row of label and value | Section "Other" holds `UPC`, `BSIN` (the code at the end of the product URL) and `SKU`. 52, 83 and 84 rows on the three laptops checked. `specs` is `None` when the sheet did not open after 3 clicks: in one of two later fresh-browser runs that happened on the MacBook (`0 spec rows`), while the other run got its 52 rows |
 
@@ -542,6 +546,8 @@ organic SKUs on page: ['6667483', '13214744', '12341769', '6673811', '6667482']
 - **Busy main thread.** Right after navigation, `Runtime.evaluate` and `Page.navigate` sometimes exceeded browser-harness's 5 s IPC default (`Runtime.evaluate timed out`, `Page.navigate timed out after 5s`). `DOM.getBoxModel` timed out the same way while clicking "See all specifications". The blocks pass `_response_timeout=30` to those CDP calls and retry on `RuntimeError` or `TimeoutError` (browser-harness raises a `TimeoutError` subclass for IPC timeouts). Once a tab hung mid-navigation (title stuck as the URL, every evaluate timing out); `cdp("Page.stopLoading")` plus a new navigate recovered it, so `nav()` does exactly that when `Page.navigate` times out, and raises if the retry times out too. In a later probe a tab stayed hung even after `Page.stopLoading` and a navigate to `about:blank` (every `Runtime.evaluate` timed out); the search block bounds every wait by its page deadline, so a tab like that ends in an error instead of an endless wait.
 - **Lazy price blocks.** One top-to-bottom scroll left some cards unpriced; scrolling each unpriced card into view filled them in (24 of 24 on pages 2 and 3). The retry includes "Unavailable" and "Sold Out" cards, which do get a price block when in view; the loop gives up after 3 passes, so a card that never renders one keeps `price: null`.
 - **Hydration order on product pages.** JSON-LD is there first; the main price block and `_BBY_DATA_.skus` arrive later (the `isPDP` entry took 12-18 s in one trace, and once did not appear within 20 s). A "See all specifications" click before hydration did nothing, hence the wait and retry.
+- **Card shells mean the product API is failing.** In 2 fresh cloud browsers on 2026-10-23, page 1 of `gaming laptop` loaded but 17 and 15 of its 24 cards stayed shells: an `h3` with no title, a link with no `href`, "Not Yet Reviewed", "See price in cart" and no price block. A reload with Network events on showed 149 of the page's 156 `/gateway/graphql` requests failing with `net::ERR_HTTP2_PROTOCOL_ERROR` (7 returned 200), the same HTTP/2 stream error plain curl gets. The search block raised `page 1 failed after 1 attempt(s) within 120 s: 15 of 24 cards still lack SKU, title or URL`; revisiting that many shells used enough of the 120 s that no second attempt fit. Treat it like a block: stop, back off, and use a new session later (the next session, about 15 minutes later, rendered every card on pages 1-4, and the one after it crawled all 5 pages).
+- **Page 5 can run out of time.** In 2 other fresh browsers that day, pages 1-4 completed and page 5 used its whole 120 s in the first attempt, raising `out of time while revisiting unrendered cards` once and `out of time while waiting for product titles` once. In the second case every `Runtime.evaluate` on the tab then timed out (a hung tab, see "Busy main thread"). The block raises rather than return 4 pages as the full crawl; rerun in a new browser.
 - **Store and ZIP come from your IP.** The header shows a nearby store; pickup and shipping text depend on it. A different exit location can change those fields and sometimes ranking.
 - **Sponsored duplicates.** One SKU appeared as both a sponsored and an organic card on the same page, and a few SKUs repeat across `cp` pages. Dedupe on `sku`.
 - **Selector drift.** The site is a Next.js app with utility-class styling. Rely on `data-testid`, `data-product-id`, JSON-LD and `_BBY_DATA_`; avoid class names other than `product-list-item` and `slContainer`.
