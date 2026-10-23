@@ -251,7 +251,7 @@ def browser_app(app_id):
         try {
           const d = JSON.parse(s.textContent);
           for (const it of (Array.isArray(d) ? d : [d])) {
-            const id = it && typeof it.url === 'string' ? new URL(it.url, location.href).searchParams.get('id') : null;
+            const id = it && typeof it.url === 'string' && it.url && !it.url.startsWith('#') ? new URL(it.url, location.origin).searchParams.get('id') : null;
             if (it && it.applicationCategory && id === want) { ld = it; break; }
           }
         } catch (e) {}
@@ -338,7 +338,7 @@ def developer_name(app_id):
         try {
           const d = JSON.parse(s.textContent);
           for (const it of (Array.isArray(d) ? d : [d])) {
-            const id = it && typeof it.url === 'string' ? new URL(it.url, location.href).searchParams.get('id') : null;
+            const id = it && typeof it.url === 'string' && it.url && !it.url.startsWith('#') ? new URL(it.url, location.origin).searchParams.get('id') : null;
             if (it && it.applicationCategory && id === %s) {
               const a = Array.isArray(it.author) ? it.author[0] : it.author;
               return typeof a === 'string' ? a : (a && a.name) || null;
