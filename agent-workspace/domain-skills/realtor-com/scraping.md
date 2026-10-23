@@ -18,7 +18,7 @@ robots.txt (checked 2026-10-23) allows `/realestateandhomes-search/<location>`, 
 
 Run this first. It opens one tab and walks up to `MAX_PAGES` pages, reading the router loader data. It saves `realtor_listings.json` in the system temp dir, which blocks 2 and 3 read.
 
-Each page load is checked: the block waits until the tab's URL is the requested page and its loader data is ready, retries the load with backoff, and raises if a page still has no data. It stops at the first short page (fewer than 42 rows), which is the real end. If it stops because of `MAX_PAGES` instead, it prints `STOPPED AT MAX_PAGES` with the count collected so far.
+Each page load is checked: the block waits until the tab's URL is the requested page and its loader data is ready. A page without loader data (which includes a 429, error or challenge page) is loaded at most `TRIES` (3) times, 5 s then 10 s apart, all well under the 120 s cap block 2 uses, and then the block raises. It stops at the first short page (fewer than 42 rows), which is the real end. If it stops because of `MAX_PAGES` instead, it prints `STOPPED AT MAX_PAGES` with the count collected so far.
 
 ```python
 import json, os, tempfile, time, urllib.parse
@@ -146,7 +146,7 @@ With `LOCATION = "78704"` and `MAX_PAGES = 12`, the same block walked the whole 
 
 This needs a www.realtor.com tab (block 1 leaves one open), because `fetch()` must be same-origin. It reads the saved `realtor_listings.json`, fetches each listing's HTML from inside the page and parses `__NEXT_DATA__`.
 
-The fetch is started in the page and polled, because one `js()` call gives up after about 5 s and a listing fetch can take longer. A 429, a 5xx, a network error or a page without listing data is retried with backoff (honoring `Retry-After` as seconds or an HTTP date). Waits are capped at `MAX_WAIT_S` (120 s): if the server asks for longer, the block stops the batch, saves what it has and raises. It never sleeps after the last try. A response for a different property than requested counts as a failure. The block saves what succeeded, then raises with the list of listings that still failed, so a partial batch never looks complete.
+The fetch is started in the page and polled, because one `js()` call gives up after about 5 s and a listing fetch can take longer. A 429, a 5xx, a network error or a page without listing data gets a bounded retry: at most `TRIES` (4) fetches per listing, waiting the `Retry-After` value (seconds or an HTTP date) or else 5, 10, 20 s. Waits are capped at `MAX_WAIT_S` (120 s): if the server asks for longer, the block stops the batch at once, saves what it has and raises. It never sleeps after the last try. A listing still failing after 4 tries, or a response for a different property than requested, counts as failed and the batch moves to the next listing. At the end the block saves what succeeded, then raises with the list of listings that failed, so a partial batch never looks complete.
 
 ```python
 import email.utils, json, os, tempfile, time, urllib.parse
@@ -484,7 +484,7 @@ Block 3 prints `name`, `price`, `availability`, `beds`, `baths`, `sqft`, `year_b
 
 ## Gotchas
 
-- **No HTTP shortcut.** Plain HTTP is blocked (status 429 on the first request for search and listing URLs); this skill uses a normal browser session. That session loaded every page tried, about 30 navigations in the first run with 2-3 s pauses, with no challenge page and no 429. If a challenge or a 429 does appear, stop and back off.
+- **No HTTP shortcut.** Plain HTTP is blocked (status 429 on the first request for search and listing URLs); this skill uses a normal browser session. That session loaded every page tried, about 30 navigations in the first run with 2-3 s pauses, with no challenge page and no 429. If one does appear, the blocks retry only within fixed bounds and then raise: blocks 1 and 3 load a page with no data at most 3 times (5 s, then 10 s apart); block 2 fetches a listing at most 4 times, honoring `Retry-After` up to 120 s, and stops the batch at once if the server asks for longer. After a raise, back off; neither block changes session, identity or network to get past a 429 or challenge.
 - **The DOM is lazy.** Right after load, only 8-10 `[data-testid="property-card"]` cards were rendered (two loads), next to 32-34 `property-card-skeleton` placeholders. The count varies per load. The loader data already had all 42 rows, so read that, not the cards.
 - **Search JSON-LD lacks usable baths and status.** Search pages carry a `CollectionPage` -> `ItemList` of 42 `RealEstateListing` items with name, URL, price (as a string), beds, sqft, address and geo. A few items carry `numberOfBathroomsTotal` with an empty value (7 of 42 in one check); the rest have no baths key. There is no status and no total. The router loader data has all of them.
 - **`__NEXT_DATA__` on search pages is a stub** (`{"props":{"pageProps":{"geo":{"area_type":"city"}}}}`). Search moved to React Router. Listing pages still use Next.js.

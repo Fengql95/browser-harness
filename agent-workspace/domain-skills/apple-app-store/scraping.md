@@ -2,7 +2,7 @@
 
 Field-tested against apps.apple.com and itunes.apple.com on 2026-10-23 using a Browser Use cloud browser (and plain HTTP).
 
-robots.txt (checked 2026-10-23): itunes.apple.com disallows `/search*` for all user agents and does not disallow `/lookup`; apps.apple.com does not disallow `/<country>/app/` pages and disallows `*/search?*`.
+robots.txt (checked 2026-10-23): itunes.apple.com disallows `/search*` for all user agents and has no rule that matches `/lookup` (its `/*/lookup?` rule needs a path segment before `lookup`), so it allows the Lookup API; apps.apple.com does not disallow `/<country>/app/` pages and disallows `*/search?*`. This skill calls Apple's documented public iTunes Search API (https://performance-partners.apple.com/search-api, checked 2026-10-23), which documents both `itunes.apple.com/search` and `itunes.apple.com/lookup`. It uses `itunes.apple.com/search` as that documented API even though robots.txt, which is written for crawlers, disallows `/search*`. None of its code blocks request the apps.apple.com search pages.
 
 ## Quick summary
 

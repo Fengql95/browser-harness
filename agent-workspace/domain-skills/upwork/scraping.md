@@ -91,7 +91,7 @@ def open_page(url, timeout=30):
 
 ### 1. Scrape 2+ skill pages and enrich every job from its detail page
 
-Run block 0 first in the same script.
+Run block 0 first in the same script. A full run writes `upwork_jobs.jsonl`. If `Blocked` stops the run, the jobs read so far go to `upwork_jobs.partial.jsonl` instead, the block prints a `PARTIAL:` line and re-raises `Blocked`, so a stopped run never looks like a full one. Any other error (a skill page that cannot be read) raises before anything is written.
 
 ```python
 TIER = {1: "Entry level", 2: "Intermediate", 3: "Expert"}   # 0 = not specified
@@ -175,16 +175,20 @@ try:
                 raise Blocked(f"2 detail pages in a row returned 403 (last: {card['url']})")
             time.sleep(2)                # polite pacing: ~1 page per 2-4 s
 except Blocked as e:
-    stopped = str(e)
-    print("STOPPED, back off before retrying:", stopped)
+    stopped = e
+    print("STOPPED, back off before retrying:", e)
 
-with open("upwork_jobs.jsonl", "w") as f:
+OUT = "upwork_jobs.partial.jsonl" if stopped else "upwork_jobs.jsonl"   # a stopped run never writes the full-run name
+with open(OUT, "w") as f:
     for r in rows:
         f.write(json.dumps(r) + "\n")
-print(len(rows), "jobs saved;", sum(r["detail_error"] is not None for r in rows), "without detail data")
+print(len(rows), "jobs saved to", OUT + ";", sum(r["detail_error"] is not None for r in rows), "without detail data")
 print(json.dumps(rows[:2], indent=1))
 print("missing country:", sum(r["client_country"] is None for r in rows),
       "missing proposals:", sum(r["proposals"] is None for r in rows))
+if stopped:
+    print(f"PARTIAL: the run stopped early; {len(rows)} jobs in {OUT} are not all of {SKILLS}")
+    raise stopped
 ```
 
 Observed output (trimmed):
@@ -193,7 +197,7 @@ Observed output (trimmed):
 web-scraping: 30 cards of 291 open jobs (no page 2 exists; the rest are not reachable logged out)
 python: 30 cards of 1631 open jobs (no page 2 exists; the rest are not reachable logged out)
   detail failed: HTTP 403 /freelance-jobs/apply/Port-Viva-com-payment-module-Odoo-and-add-ISV-key_~022113260749740632003/
-57 jobs saved; 1 without detail data
+57 jobs saved to upwork_jobs.jsonl; 1 without detail data
 [
  {
   "id": "~022112614550818987209",
@@ -217,6 +221,8 @@ python: 30 cards of 1631 open jobs (no page 2 exists; the rest are not reachable
 ]
 missing country: 1 missing proposals: 1
 ```
+
+The stop path was checked locally with this block's code and a stubbed `open_page` that raised `Blocked` on the 3rd detail page: 2 jobs went to `upwork_jobs.partial.jsonl`, no `upwork_jobs.jsonl` was written, and the block printed `PARTIAL:` and re-raised `Blocked`.
 
 Distribution: 31 fixed-price / 26 hourly; Intermediate 34, Expert 19, Entry level 3, unspecified 1; proposals ranged 0 to 660.
 
@@ -290,7 +296,7 @@ Also present but not returned: detail `job.clientActivity` has `totalHired`, `to
 - **"Load more jobs" only reveals what is already embedded.** The rendered python page showed 10 cards; one click on "Load more jobs" showed 20 and the button disappeared. No new job request was made and all shown ids were among the 30 in `__NUXT_DATA__`. The data-entry page rendered all 30 with no button. Read the payload, not the DOM.
 - **Client country formats are mixed in the source**, and the page renders them as-is: full names (`"United States"`, `"India"`) and 3-letter codes (`"USA"`, `"IND"`, `"CAN"`, `"GBR"`) appeared in the same run. Normalize if you group by country.
 - **JSON-LD is misleading for country.** The detail page's `JobPosting` JSON-LD had `jobLocation.address.addressCountry: "US"` for a client located in India. Use `buyer.location.country`.
-- **Private listings return 403 with a normal Upwork page.** One job (`...Port-Viva-com-payment-module-Odoo-and-add-ISV-key_~022113260749740632003/`) loaded in the browser with navigation status 403, a `__NUXT_DATA__` payload and the text "This job is a private listing." Block 1 keeps its card-level fields, sets `detail_error: "HTTP 403"` and moves on. A 403 page without `__NUXT_DATA__`, a "Just a moment" title, a 429, or two 403s in a row raise `Blocked` and stop the run.
+- **Private listings return 403 with a normal Upwork page.** One job (`...Port-Viva-com-payment-module-Odoo-and-add-ISV-key_~022113260749740632003/`) loaded in the browser with navigation status 403, a `__NUXT_DATA__` payload and the text "This job is a private listing." Block 1 keeps its card-level fields, sets `detail_error: "HTTP 403"` and moves on. A 403 page without `__NUXT_DATA__`, a "Just a moment" title, a 429, or two 403s in a row raise `Blocked` and stop the run: block 1 saves what it has to `upwork_jobs.partial.jsonl`, prints `PARTIAL:` and re-raises.
 - **No consent banner or login wall** appeared on `/freelance-jobs/` pages in the cloud browser.
 - The HTTP status comes from `performance.getEntriesByType('navigation')[0].responseStatus` (Chrome 109+).
 - `js()` calls time out after 5 s, so do not run slow multi-request `fetch()` loops inside the page; navigate instead.

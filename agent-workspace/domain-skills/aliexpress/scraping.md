@@ -11,7 +11,7 @@ robots.txt (checked 2026-10-23 on `www.aliexpress.com`) does not disallow `/w/` 
 - **Plain HTTP works for search pages** (about 830 KB of HTML per page, data embedded) with a truthful client User-Agent. 6 pages at 3 s spacing returned 60 cards each, no captcha.
 - **The browser works for search pages too** and reads the same object straight from `window`. Both paths repeat some products across pages, so dedupe by `product_id`.
 - **Stop on `zero_result`, not on a short page.** A narrow query returned 39 cards on page 1 (`totalResults` 40), then 60 cards on pages 2 and 3 (`totalResults` 438).
-- **Pagination stops at page 60.** `page=60` returned 60 cards; `page=61` and `page=100` returned `searchResultType: "zero_result"` with 0 cards, while page 60 of the same "phone case" query still reported `totalResults` 183,155. That is at most 3,600 cards per query.
+- **Pagination stops at page 60.** `page=60` returned 60 cards; `page=61` and `page=100` returned `searchResultType: "zero_result"` with 0 cards, while page 60 of the same "phone case" query still reported `totalResults` 183,155. That is at most 3,600 cards per query and sort (the 60-page cap was measured on the default sort; other `sortType` values were checked only on their first one or two pages). Treat 3,600 as the limit: this skill does not rerun one query under other sorts or reshaped queries to collect past the cap.
 - **Product pages are client-rendered.** The HTML has no product data (`window.runParams` is empty). The page calls `acs.aliexpress.us/h5/mtop.aliexpress.pdp.pc.query`, a JSONP response with variants (SKUs), per-SKU price and stock, the default shipping option, store info, rating and specs. Read that response with CDP `Network.getResponseBody` in the browser.
 - **Product pages can be refused almost immediately.** In 3 separate test sessions the product API first answered `FAIL_SYS_USER_VALIDATE` (slider captcha) on product page 1, on page 2, and not within 13 pages. Treat product pages as a small enrichment step, not a bulk source. Search pages kept working in the same browsers.
 - **Plain HTTP does not work for product pages**: both `www.aliexpress.com/item/<id>.html` and `www.aliexpress.us/item/<id>.html` failed with an infinite 302 redirect loop.
@@ -361,7 +361,7 @@ Pass `sort=` to `search_url` / `search` / `search_in_browser` (it becomes `sortT
 | `price_asc` | Price low to high | 0.33, 0.33, 0.78, 0.86 | not counted |
 | `price_desc` | Price high to low | 765, 588.09, 465.69, 261.85 (a later run: 337.03, 261.29) | not counted |
 
-Pass the same `normalize()` / `EXTRACT` over every sort. Popular sort had about half its cards as welcome deals, so any extractor that only reads `prices` loses price on half that sort.
+Use a sort to choose the order you want, not to read past the 3,600-card cap. Pass the same `normalize()` / `EXTRACT` over every sort. Popular sort had about half its cards as welcome deals, so any extractor that only reads `prices` loses price on half that sort.
 
 ### 3. Product page: variants, per-variant price and stock, shipping, store
 
