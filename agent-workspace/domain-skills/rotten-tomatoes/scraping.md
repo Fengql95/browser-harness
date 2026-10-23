@@ -231,7 +231,12 @@ for r in rows[:5]:
         continue
     try:
         d = rt_title(r["url"])
-    except (OSError, LookupError, ValueError) as e:  # 404 for removed titles, retries exhausted, no data
+    except urllib.error.HTTPError as e:
+        if e.code in (403, 429):
+            raise  # blocked, or still rate limited after rt_get's retries: stop the run and back off
+        failed.append((r["url"], repr(e)[:80]))  # e.g. 404 for a removed title
+        continue
+    except (OSError, LookupError, ValueError) as e:  # network error after retries, no data
         failed.append((r["url"], repr(e)[:80]))
         continue
     print(json.dumps({k: d[k] for k in ("title", "tomatometer", "tomatometer_reviews", "popcornmeter",
