@@ -2,6 +2,8 @@
 
 Field-tested against www.allbirds.com, colourpop.com, www.deathwishcoffee.com, www.tentree.com, kith.com, shop.ruggable.com, www.gymshark.com and www.fashionnova.com on 2026-10-23 using a Browser Use cloud browser and plain HTTP (Python `urllib`).
 
+robots.txt (checked 2026-10-23) on all 8 stores allows `/products.json`, `/products/<handle>.js`, `/collections.json`, `/sitemap.xml` and product pages for all user agents; gymshark.com disallows `/collections/*/products*`, which this skill does not use there.
+
 ## Quick summary
 
 - Most Shopify stores run on the standard Online Store theme engine and serve the whole public catalog as JSON at `/products.json?limit=250&page=N`. No browser, no auth, no API key. Observed: Allbirds 461 products / 5,288 variants in 2 pages, ColourPop 1,064 in 5 pages, tentree 1,847 / 8,203 variants in 8 pages, Death Wish Coffee 153 in 1 page.
@@ -26,7 +28,7 @@ Field-tested against www.allbirds.com, colourpop.com, www.deathwishcoffee.com, w
 
 ### 1. Full catalog via `/products.json` (plain Python, no browser)
 
-Stdlib only. Paginates until the empty page, reports the 25,000 cap when it stops there, retries 429/5xx and network errors with `Retry-After` (seconds or HTTP-date) or exponential backoff, raises when retries run out, dedupes on product `id`, and writes one row per variant.
+Stdlib only. Paginates until the empty page, reports the 25,000 cap when it stops there, retries 429/5xx and network errors with `Retry-After` (seconds or HTTP-date) or exponential backoff, stops if the server asks for more than 120 s, raises when retries run out, dedupes on product `id`, and writes one row per variant.
 
 ```python
 import json, time, gzip, email.utils, urllib.request, urllib.error
@@ -36,17 +38,22 @@ STORE = "https://www.deathwishcoffee.com"   # any Shopify storefront origin, no 
 UA = "browser-harness-skill-example"        # a truthful client UA; every Online Store store tested returned 200 to it
 
 def retry_delay(value, attempt):
-    """Retry-After is either delay-seconds or an HTTP-date; fall back to exponential backoff."""
+    """Retry-After is either delay-seconds or an HTTP-date; fall back to exponential backoff. Stop if asked to wait > 120 s."""
+    wait = None
     if value:
         try:
-            return min(120.0, max(0.0, float(value)))
+            wait = max(0.0, float(value))
         except ValueError:
             try:
                 when = email.utils.parsedate_to_datetime(value)
-                return min(120.0, max(0.0, (when - datetime.now(timezone.utc)).total_seconds()))
+                wait = max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
             except (TypeError, ValueError):
                 pass
-    return 2 ** (attempt + 1)
+    if wait is None:
+        return 2 ** (attempt + 1)
+    if wait > 120:
+        raise RuntimeError(f"server asked to wait {wait:.0f} s (Retry-After: {value}); stopping, back off and try later")
+    return wait
 
 def get_json(url, tries=4):
     """Return (status, parsed_json_or_error_text). Raises if 429/5xx/network errors persist."""
@@ -234,7 +241,7 @@ just-don-miami-hurricanes-orange | Just Don | Accessories | 1 variants | first 9
 
 ### 4. Browser fallback: same-origin `fetch` from the storefront
 
-Use this when plain HTTP is challenged or rate limited but a real browser session loads the store. Rows are compacted in the page so each `js()` call returns a small payload.
+Use this when plain HTTP is blocked but a normal browser session loads the store. Rows are compacted in the page so each `js()` call returns a small payload.
 
 ```python
 import json, time
@@ -305,7 +312,7 @@ import json, re, time
 
 STORE = "https://www.gymshark.com"
 SAMPLE = 3   # product pages to visit; keep pacing >= 2 s per page
-UA = {"User-Agent": "browser-harness-skill-example"}   # gymshark's sitemap returned 403 to the bare Python urllib UA, 200 to this
+UA = {"User-Agent": "browser-harness-skill-example"}   # a truthful client UA
 
 def locs(xml):
     return [u.replace("&amp;", "&") for u in re.findall(r"<loc>\s*([^<\s]+)\s*</loc>", xml)]
@@ -415,7 +422,7 @@ Extra in `/products/<handle>.js`: `price`, `price_min`, `price_max`, `compare_at
 - Collections: `/collections.json?limit=250` lists collections with `products_count` (Death Wish: 126), and `/collections/<handle>/products.json` has the same shape. `/collections/all/products.json` returned the full 153 products. Some collections are empty (returned 0).
 - Error bodies are gzip-encoded when you send `Accept-Encoding: gzip`; decompress before reading the 400 cap message.
 - Unknown handles: `/products/<missing>.js` returns 404.
-- No browser User-Agent is needed: the truthful UA `browser-harness-skill-example` got 200 from every Online Store store and from both headless sitemaps. The bare Python urllib UA also worked except on gymshark's sitemap (403). No 429 was observed (roughly 100 requests across 8 stores, paced 0.5-1 s apart), so keep that pace and honor `Retry-After` if one appears.
+- No browser User-Agent is needed: the truthful UA `browser-harness-skill-example` got 200 from every Online Store store and from both headless sitemaps. No 429 was observed (roughly 100 requests across 8 stores, paced 0.5-1 s apart), so keep that pace and honor `Retry-After` if one appears.
 - Prices are in the storefront's default currency (USD on every store tested; `window.Shopify.currency.active` shows it in the browser). The `.js` endpoint returns cents, the `.json` list returns decimal strings.
 - Headless store JSON-LD is per product page, so a full crawl costs one page load per product: fashionnova's product sitemap had 37,840 URLs, gymshark's 2,984. Budget time accordingly and pace at >= 2 s per page.
 - Gymshark's sitemap index also lists localized copies (`/es-US/sitemap_products_1.xml`); block 5 filters `xx-YY` locale paths to avoid duplicates.

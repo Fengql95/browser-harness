@@ -2,9 +2,11 @@
 
 Field-tested against www.tripadvisor.com on 2026-10-23 using a Browser Use cloud browser (plain HTTP was also tried and is blocked); every code block re-run verbatim in a fresh cloud browser the same day.
 
+robots.txt (checked 2026-10-23) allows the paths this skill loads (`/`, `/Tourism-`, `/Hotels-`, `/Restaurants-`, `/Hotel_Review-`, `/Restaurant_Review-`) for `User-agent: *` and disallows `/Search`; it disallows `/` entirely for named AI crawlers such as ClaudeBot, GPTBot and CCBot.
+
 ## Quick summary
 
-- Plain HTTP does not work: `curl` and `http_get` with a full Chrome User-Agent both got **HTTP 403** (778-byte block page) on the city hotel list and the city restaurant list. Use the browser.
+- Plain HTTP is blocked (status 403, 778-byte block page) on the city hotel list and the city restaurant list; this skill uses a normal browser session.
 - In the browser, logged out, no consent banner or captcha appeared across ~30 page loads (Boston and Lisbon, US-English site, USD).
 - Every list page embeds a schema.org **`ItemList` JSON-LD** with the 30 organic results of that page (name, rating, review count, URL, address, geo, phone, price range). Rank, the "#N Best Value" text and the hotel "from $X" price come from the cards (`data-automation` attributes).
 - Pagination is a URL offset: insert `-oa30-`, `-oa60-`, ... right after the `g<geoId>` segment. 30 ranked results per page, plus sponsored cards to skip.
@@ -443,7 +445,7 @@ Real output (trimmed):
 
 ## What does not work
 
-- **Plain HTTP:** `curl` and `http_get` (Chrome UA + `Accept-Language`) returned `HTTP 403` for `Hotels-g60745-Boston_Massachusetts-Hotels.html` and `Restaurants-g60745-Boston_Massachusetts.html`.
+- **Plain HTTP:** plain HTTP is blocked (status 403) for `Hotels-g60745-Boston_Massachusetts-Hotels.html` and `Restaurants-g60745-Boston_Massachusetts.html`; this skill uses a normal browser session.
 - **`/Search?q=Lisbon+Portugal`** rendered only the header and footer in the browser (no result links after 10+ s). Use the typeahead (block 1).
 - **Clicking "See all N hotels" without closing the date picker** selects a calendar date instead and leaves 5 hotels on the page.
 - **`-oa0-` / `-oa5-` offsets** redirect to the unexpanded page 1; only multiples of 30 from `-oa30-` up behaved as pages in this run.

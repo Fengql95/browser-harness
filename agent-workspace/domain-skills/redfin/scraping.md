@@ -1,69 +1,118 @@
 # Redfin — For-sale listings by city or ZIP, plus listing details
 
-Field-tested against www.redfin.com on 2026-10-23 (re-run after the retry/raise changes the same day) using a Browser Use cloud browser and plain-Python HTTP (urllib).
+Field-tested against www.redfin.com on 2026-10-23 (reworked the same day to use only robots.txt-allowed pages) using a Browser Use cloud browser.
+
+robots.txt (checked 2026-10-23) disallows `/stingray/` for `User-agent: *`; this skill never requests it. It only loads search pages (`/zipcode/<zip>` and `/city/<id>/<ST>/<City>`, the two tested here; block 1 also accepts `/neighborhood/...` and `/county/...` paths), their `/page-<n>` pages, and listing pages (`/<ST>/<City>/<address>/home/<id>`). None of those is disallowed for that group.
 
 ## Quick summary
 
-- Redfin's own map/list UI is fed by a same-origin JSON endpoint, `/stingray/api/gis`. Called from inside a Redfin tab with `fetch()`, it returned every for-sale home in a region: address, price, beds, baths, sqft, status, lat/long and URL, plus remarks, key facts, tags, HOA, lot size and year built.
-- Pagination is `start=<offset>` with `num_homes=<page size>`. `page_number` is ignored. The city of Austin, TX returned 5,793 unique homes in 17 calls of 350 (about 61 s with a 2 s pause).
-- City / ZIP / neighborhood / county text is turned into a `region_id` + `region_type` with `/stingray/do/location-autocomplete`, also called from the tab.
-- Listing detail pages carry a `["Product", "RealEstateListing"]` JSON-LD block (price, beds, baths, sqft, year built, geo, photos, description). Three more same-origin endpoints add status, lot size, full/half baths and every MLS fact group.
-- Plain HTTP (no browser): `/stingray/api/gis` answered 200 to urllib, so bulk search works without a browser once you know the region id. Autocomplete, detail pages and the detail APIs did not (403 / 202 empty), so use the browser for those.
+- A Redfin search page (`/zipcode/78704`, `/city/30818/TX/Austin`) renders about 41 listing cards per page and also embeds, in its HTML, the server-rendered map data for up to 350 homes: address, price, beds, baths, sqft, status, lot size, year built, HOA, days on market, MLS id, lat/long and URL.
+- A ZIP with 350 homes or fewer comes back complete from one page load: ZIP 78704 gave all 332 homes the page header counted.
+- Bigger results are paged through `/page-<n>` (the site's own pagination links). Homes beyond the first 350 come from the card itself (address, price, beds, baths, sqft, lat/long, URL) without status, lot, year built, HOA or MLS id. The city of Austin, TX (header: 5,788 homes + 120 early access) took 150 page loads in about 15 minutes and gave 5,796 unique homes, 112 (1.9%) short of the header, so with its default 1% tolerance block 1 raises there; details below.
+- Listing pages carry a `["Product", "RealEstateListing"]` JSON-LD block (price, beds, baths, sqft, year built, geo, photos, description) and embed the detail data the page was rendered from (status, lot size, full/half baths, every MLS fact group).
+- Plain HTTP is blocked (status 429); this skill uses a normal browser session.
 
 ## What works
 
-### 1. Search a city or ZIP and collect every listing (browser)
+### 1. Search a ZIP or city and collect every listing (browser)
 
-Self-contained. Change `QUERY`. Writes JSON and CSV to the system temp dir.
+Self-contained. Change `SEARCH` to a ZIP or to a search page path. Writes JSON and CSV to the system temp dir.
 
 ```python
-import json, time, csv, os, tempfile, urllib.parse
+import json, time, csv, os, re, tempfile
 
-QUERY = "Austin, TX"        # a city, a ZIP ("78704"), a neighborhood or a county
-PAGE_SIZE = 350             # the page size Redfin's own map uses
-MAX_PAGES = 30              # safety cap (raises if hit); Austin needed 17 pages
-PAUSE = 2.0                 # seconds between API calls
+SEARCH = "78704"     # a ZIP, or a Redfin search page path such as "/city/30818/TX/Austin"
+MAX_PAGES = 200      # safety cap on list pages (raises if hit); Austin needed 150
+PAUSE = 3.0          # seconds between page loads
+MAX_SHORT = 0.01     # raise if more than this share of the header count is missing (a live count drifts a little)
+BASE = "https://www.redfin.com"
 
-new_tab("https://www.redfin.com/")
-wait_for_load(30)
+def search_path(s):
+    s = s.strip()
+    if re.fullmatch(r"\d{5}", s):
+        return f"/zipcode/{s}"
+    s = re.sub(r"/page-\d+$", "", s.replace(BASE, "").split("?")[0].rstrip("/"))
+    if not re.match(r"^/(city|zipcode|neighborhood|county)/", s):
+        raise SystemExit(f"SEARCH must be a ZIP or a Redfin /city/, /zipcode/, /neighborhood/ or /county/ path, got {s!r}")
+    return s
 
-def rf(path, timeout=60, tries=3):
-    """GET a same-origin /stingray endpoint from inside the Redfin tab and return parsed JSON.
-    The fetch runs in the page and is polled, because a single js() call gives up after about 5 s.
-    Retries with backoff (5 s, 10 s), then raises, so a failed call never looks like an empty result."""
+BLOCKED = re.compile(r"request could not be satisfied|ratelimited|access denied|are you a human|captcha", re.I)
+CARDS = '[data-rf-test-name="basicNode-homeCard"]'
+
+def open_page(url, tries=3, timeout=60):
+    """Load url in the tab and wait until result cards render. Returns the URL the tab landed on.
+    A block or challenge page raises at once (stop and back off). A page that never renders cards
+    is retried after 10 s and 20 s, then raises."""
     for attempt in range(tries):
-        k = json.dumps("__rf_%d" % time.time_ns())
-        js("window[%s] = null; fetch(%s).then(async r => { window[%s] = JSON.stringify({status: r.status, text: await r.text()}); })"
-           ".catch(e => { window[%s] = JSON.stringify({status: 0, text: String(e)}); }); 1" % (k, json.dumps(path), k, k))
-        raw, deadline = None, time.time() + timeout
-        while not raw and time.time() < deadline:
-            time.sleep(0.5)
-            raw = js("window[%s]" % k)
-        js("delete window[%s]; 1" % k)
-        r = json.loads(raw) if raw else {"status": "timeout", "text": ""}
-        if r["status"] == 200 and r["text"].startswith("{}&&"):
-            return json.loads(r["text"][4:])      # strip the "{}&&" prefix
-        print(f"stingray try {attempt + 1}/{tries} failed:", r["status"], path[:90], r["text"][:120])
+        try:
+            goto_url(url)
+        except Exception as e:       # Page.navigate often outlives the 5 s daemon wait on these heavy pages
+            print("navigate still running:", str(e)[:80])
+        deadline, n, last = time.time() + timeout, -1, None
+        while time.time() < deadline:
+            time.sleep(1)
+            try:
+                st = json.loads(js("JSON.stringify({u: location.href, t: document.title, r: document.readyState, "
+                                   "n: document.querySelectorAll('%s').length})" % CARDS.replace("'", "\\'")))
+            except Exception:
+                continue                 # page still busy; poll again
+            if BLOCKED.search(st["t"]) or "ratelimited" in st["u"]:
+                raise RuntimeError(f"Redfin served a block/challenge page ({st['t']!r} at {st['u']}). Stop and back off.")
+            if st["r"] == "complete" and st["n"] > 0 and st["n"] == n:
+                return st["u"]           # card count stable across two polls
+            n, last = st["n"], st
+        print(f"try {attempt + 1}/{tries}: no result cards at {url} (last state {last})")
         if attempt + 1 < tries:
-            time.sleep(5 * 2 ** attempt)
-    raise RuntimeError(f"stingray call failed {tries} times: {path[:120]}")
+            time.sleep(10 * 2 ** attempt)
+    raise RuntimeError(f"page never rendered result cards after {tries} tries: {url}")
 
-# autocomplete row type -> gis region_type
-REGION_TYPE = {"2": 6, "4": 2, "6": 1, "5": 5}   # city, zip, neighborhood, county
+def header_total():
+    """'323 homes + 9 early access' -> 332."""
+    t = js("(document.querySelector('.homes.summary, [data-rf-test-id=\"homes-description\"]') || {}).innerText || ''")
+    nums = [int(x.replace(",", "")) for x in re.findall(r"([\d,]+) (?:homes?|early access)", t)]
+    if not nums:
+        raise RuntimeError(f"could not read the result count from the page header: {t!r}")
+    return sum(nums), t
 
-def resolve_region(query):
-    d = rf("/stingray/do/location-autocomplete?" + urllib.parse.urlencode({"location": query, "v": 2}))
-    for sec in (d or {}).get("payload", {}).get("sections", []):
-        for row in sec.get("rows", []):
-            if row.get("type") in REGION_TYPE:
-                return {"region_id": int(row["id"].split("_")[1]), "region_type": REGION_TYPE[row["type"]],
-                        "name": row.get("name"), "sub": row.get("subName"), "url": row.get("url")}
-    return None
+# The search page HTML embeds the server-rendered map data (up to 350 homes) in __reactServerState.
+GIS_JS = r"""(() => {
+  const s = [...document.scripts].find(s => !s.src && s.textContent.includes('__reactServerState.InitialContext = '));
+  if (!s) return null;
+  const p = 'root.__reactServerState.InitialContext = ';
+  const line = s.textContent.split('\n').find(l => l.startsWith(p));
+  const dc = JSON.parse(line.slice(p.length, -1))['ReactServerAgent.cache'].dataCache;
+  const k = Object.keys(dc).find(k => k.startsWith('/stingray/api/gis?'));
+  return k ? dc[k].res.text : null;
+})()"""
+
+def embedded_homes():
+    t = js(GIS_JS)
+    if not t or not t.startswith("{}&&"):
+        raise RuntimeError("no embedded map data on the search page: " + str(t)[:120])
+    d = json.loads(t[4:])                # strip the "{}&&" prefix
+    if d.get("resultCode") != 0 or not isinstance((d.get("payload") or {}).get("homes"), list):
+        raise RuntimeError("unexpected embedded map data: " + t[:160])
+    return {h["propertyId"]: h for h in d["payload"]["homes"]}
+
+CARD_JS = r"""JSON.stringify([...document.querySelectorAll('[data-rf-test-name="basicNode-homeCard"]')].map(c => {
+  const t = s => { const e = c.querySelector(s); return e ? e.textContent.trim() : null; };
+  const a = c.querySelector('a.bp-Homecard__Address');
+  let ld = null; const s = c.querySelector('script[type="application/ld+json"]');
+  if (s) { try { ld = JSON.parse(s.textContent); } catch (e) {} }
+  return {href: a && a.getAttribute('href'), address: a && a.textContent.trim(), price: t('.bp-Homecard__Price--value'),
+    beds: t('.bp-Homecard__Stats--beds'), baths: t('.bp-Homecard__Stats--baths'), sqft: t('.bp-Homecard__Stats--sqft'),
+    sashes: [...c.querySelectorAll(':scope > .bp-Homecard__Sashes [data-rf-test-id="home-sash"]')].map(e => e.textContent.trim()),
+    ld};
+}))"""
+
+def num(s):
+    m = re.search(r"[\d,.]+", s or "")
+    return float(m.group().replace(",", "")) if m and m.group().strip(".,") else None
 
 def v(x):
     return x.get("value") if isinstance(x, dict) else x
 
-def flatten(h):
+def from_embedded(h):
     ll = v(h.get("latLong")) or {}
     return {
         "property_id": h.get("propertyId"), "listing_id": h.get("listingId"), "mls_id": v(h.get("mlsId")),
@@ -72,83 +121,131 @@ def flatten(h):
         "lot_sqft": v(h.get("lotSize")), "year_built": v(h.get("yearBuilt")), "price_per_sqft": v(h.get("pricePerSqFt")),
         "hoa_month": v(h.get("hoa")), "days_on_market": v(h.get("dom")), "status": h.get("mlsStatus"),
         "neighborhood": v(h.get("location")), "lat": ll.get("latitude"), "lon": ll.get("longitude"),
-        "url": "https://www.redfin.com" + h["url"] if h.get("url") else None,
+        "url": BASE + h["url"] if h.get("url") else None, "source": "embedded",
     }
 
-region = resolve_region(QUERY)
-if not region:
-    raise SystemExit(f"No Redfin region found for {QUERY!r}")
-print("region", region)
+def from_card(c, pid):
+    ld = c.get("ld") or []
+    ld = [x for x in (ld if isinstance(ld, list) else [ld]) if isinstance(x, dict)]   # a card's JSON-LD can be one object or a list
+    home = next((x for x in ld if x.get("address")), {})
+    offer = next((x.get("offers") for x in ld if x.get("offers")), {}) or {}
+    addr, geo = home.get("address") or {}, home.get("geo") or {}
+    price = offer.get("price") or num(c.get("price"))
+    sq, sqft, lot = c.get("sqft") or "", None, None
+    if "(lot)" in sq:                    # land cards say "Land" and "0.38 acre (lot)" or "9,557 sq ft (lot)"
+        n = num(sq)
+        lot = None if n is None else round(n * 43560 if "acre" in sq else n)
+    else:
+        sqft = num(sq)
+    return {
+        "property_id": pid, "listing_id": None, "mls_id": None,
+        "address": addr.get("streetAddress") or (c.get("address") or "").split(",")[0],
+        "city": addr.get("addressLocality"), "state": addr.get("addressRegion"), "zip": addr.get("postalCode"),
+        "price": int(float(price)) if price else None, "beds": num(c.get("beds")), "baths": num(c.get("baths")),
+        "sqft": sqft, "lot_sqft": lot, "year_built": None, "price_per_sqft": None, "hoa_month": None,
+        "days_on_market": None, "status": None, "neighborhood": None,
+        "lat": geo.get("latitude"), "lon": geo.get("longitude"), "url": BASE + c["href"], "source": "card",
+    }
 
-q = {"al": 1, "ord": "redfin-recommended-asc", "sf": "1,2,3,5,6,7", "status": 9, "uipt": "1,2,3,4,5,6,7,8", "v": 8,
-     "region_id": region["region_id"], "region_type": region["region_type"], "num_homes": PAGE_SIZE}
-agg = rf("/stingray/api/gis-aggregates?" + urllib.parse.urlencode(q)) or {}
-if agg.get("payload"):
-    print("site count:", agg["payload"].get("numProperties"), "+", agg["payload"].get("numEarlyAccess"), "early access")
-else:
-    print("no aggregate count:", agg.get("resultCode"), agg.get("errorMessage"))
+path = search_path(SEARCH)
+new_tab()
+open_page(BASE + path)
+total, header = header_total()
+emb = embedded_homes()
+print(f"{path}: header says {header!r} -> {total}; embedded map data has {len(emb)} homes")
 
-rows, seen = [], set()
-for page in range(MAX_PAGES):
-    time.sleep(PAUSE)
-    d = rf("/stingray/api/gis?" + urllib.parse.urlencode(dict(q, start=page * PAGE_SIZE)))
-    homes = (d.get("payload") or {}).get("homes")
-    if d.get("resultCode") != 0 or homes is None:
-        raise RuntimeError(f"gis page {page + 1} returned no homes list: {str(d)[:200]}")
-    for h in homes:
-        if h.get("propertyId") not in seen:
-            seen.add(h.get("propertyId"))
-            rows.append(flatten(h))
-    print(f"page {page + 1}: {len(homes)} homes, {len(rows)} unique so far")
-    if len(homes) < PAGE_SIZE:          # a short successful page is the only end signal
-        break
-else:
-    raise RuntimeError(f"hit MAX_PAGES={MAX_PAGES} with full pages; {len(rows)} rows so far. Raise MAX_PAGES and rerun.")
+rows = {}
+if len(emb) >= total:                     # the whole result set is in the page's embedded map data
+    for pid, h in emb.items():
+        rows[pid] = from_embedded(h)
+else:                                     # page through the list (about 41 cards per page)
+    page = 1
+    while True:
+        cards = json.loads(js(CARD_JS))
+        new = 0
+        for c in cards:
+            m = re.search(r"/home/(\d+)", c.get("href") or "")
+            if not m:
+                continue
+            pid = int(m.group(1))
+            if pid not in rows:
+                rows[pid] = from_embedded(emb[pid]) if pid in emb else from_card(c, pid)
+                new += 1
+        print(f"page {page}: {len(cards)} cards, {new} new, {len(rows)} unique so far")
+        if len(rows) >= total or new == 0:
+            break
+        page += 1
+        if page > MAX_PAGES:
+            raise RuntimeError(f"hit MAX_PAGES={MAX_PAGES}; {len(rows)} of {total} rows so far. Raise MAX_PAGES and rerun.")
+        time.sleep(PAUSE)
+        landed = open_page(f"{BASE}{path}/page-{page}")
+        if not landed.rstrip("/").endswith(f"/page-{page}"):
+            print(f"page-{page} redirected to {landed}; treating it as the end of the list")
+            break
+    for pid, h in emb.items():            # embedded homes no card showed are still part of the result
+        rows.setdefault(pid, from_embedded(h))
+
+rows = list(rows.values())
+short = total - len(rows)
+if short > max(2, total * MAX_SHORT):
+    raise RuntimeError(f"collected {len(rows)} of the {total} homes the page header reports ({header!r}), {short} missing. "
+                       "Search ZIP by ZIP, or raise MAX_SHORT to accept the shortfall.")
 
 out = os.path.join(tempfile.gettempdir(), "redfin_listings")
 with open(out + ".json", "w") as f:
     json.dump(rows, f)
-if rows:
-    with open(out + ".csv", "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=list(rows[0]))
-        w.writeheader()
-        w.writerows(rows)
-print("saved", len(rows), "rows to", out + ".json", "and .csv")
+with open(out + ".csv", "w", newline="") as f:
+    w = csv.DictWriter(f, fieldnames=list(rows[0]))
+    w.writeheader()
+    w.writerows(rows)
+print("saved", len(rows), "rows to", out + ".json", "and .csv;", sum(r["source"] == "card" for r in rows), "from cards only")
 print(json.dumps(rows[:2], indent=1))
 ```
 
 Observed output (trimmed):
 
 ```text
-region {'region_id': 30818, 'region_type': 6, 'name': 'Austin', 'sub': 'Austin, TX, USA', 'url': '/city/30818/TX/Austin'}
-site count: 5791 + 119 early access
-page 1: 350 homes, 350 unique so far
-...
-page 16: 350 homes, 5600 unique so far
-page 17: 193 homes, 5793 unique so far
-saved 5793 rows to /tmp/.../redfin_listings.json and .csv
+/zipcode/78704: header says '323 homes + 9 early access' -> 332; embedded map data has 332 homes
+saved 332 rows to /tmp/.../redfin_listings.json and .csv; 0 from cards only
 [
- {"property_id": 32017342, "listing_id": 224635318, "mls_id": "8807705",
-  "address": "3305 Tavistock Dr", "city": "Austin", "state": "TX", "zip": "78748",
-  "price": 599900, "beds": 3, "baths": 2.5, "sqft": 2190, "lot_sqft": 6638, "year_built": 2007,
-  "price_per_sqft": 274, "hoa_month": 48, "days_on_market": 1, "status": "Active",
-  "neighborhood": "Bauerle Ranch", "lat": 30.1699391, "lon": -97.8444657,
-  "url": "https://www.redfin.com/TX/Austin/3305-Tavistock-Dr-78748/home/32017342"},
- {"property_id": 30979888, "address": "1601 Faro Dr #1303", "zip": "78741", "price": 249900,
-  "beds": 2, "baths": 1.0, "sqft": 900, "status": "Coming Soon", "lat": 30.233482, "lon": -97.711697, ...}
+ {"property_id": 31703545, "listing_id": 224677425, "mls_id": "3820245",
+  "address": "503 S Park Dr", "city": "Austin", "state": "TX", "zip": "78704",
+  "price": 1120000, "beds": 3, "baths": 2.5, "sqft": 1640, "lot_sqft": 11704, "year_built": 2023,
+  "price_per_sqft": 683, "hoa_month": null, "days_on_market": 1, "status": "Active",
+  "neighborhood": "SOUTH PARK SEC 2", "lat": 30.232246, "lon": -97.7638868,
+  "url": "https://www.redfin.com/TX/Austin/503-S-Park-Dr-78704/home/31703545", "source": "embedded"},
+ {"property_id": 31205095, "address": "1818 Margaret St", "price": 2995000, "beds": 3, "baths": 4.0,
+  "status": "Coming Soon", "days_on_market": null, ...}
 ]
 ```
 
-With `QUERY = "78704"` autocomplete returned row id `4_34098`, so the ZIP searches as `region_id=34098, region_type=2` (the ZIP itself is not the region id). That ZIP returned 331 homes (the page header said "321 homes + 10 early access"; 332 on the re-run). `"Travis County, TX"` resolved to `/county/2866/TX/Travis-County` (`region_id=2866, region_type=5`).
+That ZIP run took one page load. Null counts across the 332 rows: address 1, price 1, baths 7, sqft 10, lot_sqft 19, year_built 10, price_per_sqft 11, hoa_month 173, days_on_market 9, neighborhood 1. Status values: Active 322, Coming Soon 9, New 1.
 
-Null counts across the 5,793 Austin rows: address 18 (undisclosed-address listings), price 17, beds 17, baths 346, sqft 418, lot_sqft 906, year_built 922, hoa_month 2,877, days_on_market 119 (118 of them Coming Soon). Status values: Active 5,670, Coming Soon 119, Price Change 2, New 1, Back on Market 1. lat/lon and url were never null.
+Results over 350 homes page through the list. `SEARCH = "78745"` (header `357 homes + 8 early access`) took 10 page loads in 54 s and saved 369 rows, 19 of them from cards only. `SEARCH = "/city/30818/TX/Austin"`, run with `MAX_SHORT = 0.02` as the only other change, printed:
+
+```text
+/city/30818/TX/Austin: header says '5,788 homes + 120 early access' -> 5908; embedded map data has 350 homes
+page 1: 41 cards, 41 new, 41 unique so far
+...
+page 9: 22 cards, 22 new, 350 unique so far
+page 10: 41 cards, 41 new, 391 unique so far
+...
+page 144: 22 cards, 22 new, 5597 unique so far
+page 145: 41 cards, 40 new, 5637 unique so far
+...
+page 149: 36 cards, 36 new, 5796 unique so far
+page 150: 41 cards, 0 new, 5796 unique so far
+saved 5796 rows to /tmp/.../redfin_listings.json and .csv; 5446 from cards only
+```
+
+That crawl took 14 min 39 s. The 112 missing homes are close to the 120 early-access homes in the header count, so the paged list may leave most early-access homes out past the first 350; that was not checked home by home. With the default `MAX_SHORT = 0.01` the same numbers raise instead of saving (112 > 59), and an earlier full Austin crawl the same afternoon (5,795 of 5,903) did raise. For complete coverage of a big city, search it ZIP by ZIP. Across the 5,446 Austin card rows: price null 14, beds 431, baths 402, sqft 412; 390 were land cards whose lot size went to `lot_sqft`.
 
 ### 2. Key facts from a listing detail page (browser)
 
-Reads the first URL saved by block 1; pass any `https://www.redfin.com/.../home/<id>` URL to `listing_details()` instead.
+Reads the first URL saved by block 1; pass any `https://www.redfin.com/.../home/<id>` URL to `listing_details()` instead. Everything comes from the one listing page: its JSON-LD plus the detail data embedded in its HTML.
 
 ```python
-import json, os, re, time, tempfile, urllib.parse
+import json, os, re, time, tempfile
 
 # Take a listing URL from the search output (block above); any redfin.com/.../home/<id> URL works.
 saved = os.path.join(tempfile.gettempdir(), "redfin_listings.json")
@@ -157,39 +254,61 @@ URL = listings[0]["url"] if listings else None
 if not URL:
     raise SystemExit("Run the search block first, or set URL to a redfin.com listing URL")
 
-if not page_info()["url"].startswith("https://www.redfin.com"):
-    new_tab("https://www.redfin.com/")
-    wait_for_load(30)
+BLOCKED = re.compile(r"request could not be satisfied|ratelimited|access denied|are you a human|captcha", re.I)
+READY_JS = ("[...document.querySelectorAll('script[type=\"application/ld+json\"]')].some(s => s.textContent.includes('RealEstateListing'))"
+            " && [...document.scripts].some(s => !s.src && s.textContent.includes('__reactServerState.InitialContext = '))")
 
-def rf(path, timeout=60, tries=3):
-    """GET a same-origin /stingray endpoint from inside the Redfin tab and return parsed JSON.
-    The fetch runs in the page and is polled, because a single js() call gives up after about 5 s.
-    Retries with backoff (5 s, 10 s), then raises, so a failed call never looks like an empty result."""
+def open_listing(url, tries=3, timeout=60):
+    """Load a listing page and wait for its JSON-LD and embedded data. Returns the URL the tab landed on
+    (a gone listing redirects away from /home/). A block or challenge page raises at once (stop and back off).
+    A page that never finishes is retried after 10 s and 20 s, then raises."""
     for attempt in range(tries):
-        k = json.dumps("__rf_%d" % time.time_ns())
-        js("window[%s] = null; fetch(%s).then(async r => { window[%s] = JSON.stringify({status: r.status, text: await r.text()}); })"
-           ".catch(e => { window[%s] = JSON.stringify({status: 0, text: String(e)}); }); 1" % (k, json.dumps(path), k, k))
-        raw, deadline = None, time.time() + timeout
-        while not raw and time.time() < deadline:
-            time.sleep(0.5)
-            raw = js("window[%s]" % k)
-        js("delete window[%s]; 1" % k)
-        r = json.loads(raw) if raw else {"status": "timeout", "text": ""}
-        if r["status"] == 200 and r["text"].startswith("{}&&"):
-            return json.loads(r["text"][4:])      # strip the "{}&&" prefix
-        print(f"stingray try {attempt + 1}/{tries} failed:", r["status"], path[:90], r["text"][:120])
+        try:
+            goto_url(url)
+        except Exception as e:       # Page.navigate often outlives the 5 s daemon wait on these heavy pages
+            print("navigate still running:", str(e)[:80])
+        deadline, last = time.time() + timeout, None
+        while time.time() < deadline:
+            time.sleep(1)
+            try:
+                st = json.loads(js("JSON.stringify({u: location.href, t: document.title, r: document.readyState, ok: %s})" % READY_JS))
+            except Exception:
+                continue                 # page still busy; poll again
+            if BLOCKED.search(st["t"]) or "ratelimited" in st["u"]:
+                raise RuntimeError(f"Redfin served a block/challenge page ({st['t']!r} at {st['u']}). Stop and back off.")
+            if st["r"] == "complete" and (st["ok"] or "/home/" not in st["u"]):
+                return st["u"]
+            last = st
+        print(f"try {attempt + 1}/{tries}: listing page not ready at {url} (last state {last})")
         if attempt + 1 < tries:
-            time.sleep(5 * 2 ** attempt)
-    raise RuntimeError(f"stingray call failed {tries} times: {path[:120]}")
+            time.sleep(10 * 2 ** attempt)
+    raise RuntimeError(f"listing page never finished loading after {tries} tries: {url}")
+
+# The listing page HTML embeds the server-rendered detail data in __reactServerState.
+STATE_JS = r"""(() => {
+  const s = [...document.scripts].find(s => !s.src && s.textContent.includes('__reactServerState.InitialContext = '));
+  const p = 'root.__reactServerState.InitialContext = ';
+  const line = s.textContent.split('\n').find(l => l.startsWith(p));
+  const dc = JSON.parse(line.slice(p.length, -1))['ReactServerAgent.cache'].dataCache;
+  const pick = part => { const k = Object.keys(dc).find(k => k.split('?')[0].endsWith(part)); return k ? dc[k].res.text : null; };
+  return JSON.stringify({info: pick('/home/details/initialInfo'), atf: pick('/home/details/aboveTheFold'),
+                         btf: pick('/home/details/belowTheFold')});
+})()"""
+
+def payload(text, name):
+    if not text or not text.startswith("{}&&"):
+        raise RuntimeError(f"{name} is missing from the page's embedded data: {str(text)[:120]}")
+    d = json.loads(text[4:])             # strip the "{}&&" prefix
+    if d.get("resultCode") != 0 or not isinstance(d.get("payload"), dict):
+        raise RuntimeError(f"unexpected embedded {name}: {text[:160]}")
+    return d["payload"]
 
 def strip_tags(s):
     return re.sub(r"<[^>]+>", "", s or "").strip()
 
 def listing_details(url):
-    goto_url(url)
-    wait_for_load(30)
-    time.sleep(2)
-    if "/home/" not in page_info()["url"]:
+    landed = open_listing(url)
+    if "/home/" not in landed:
         return None                      # listing gone or redirected to a search page
     # 1) JSON-LD block typed ["Product", "RealEstateListing"]
     ld = None
@@ -200,14 +319,15 @@ def listing_details(url):
             continue
         if isinstance(d, dict) and "RealEstateListing" in (d.get("@type") or []):
             ld = d
-    me = (ld or {}).get("mainEntity", {})
-    offer = (ld or {}).get("offers", {})
+    if not ld:
+        raise RuntimeError("no RealEstateListing JSON-LD on " + landed)
+    me, offer = ld.get("mainEntity", {}), ld.get("offers", {})
     facts = {
         "url": url,
         "address": me.get("address", {}),
         "price": offer.get("price"),
         "availability": (offer.get("availability") or "").rsplit("/", 1)[-1],
-        "date_posted": (ld or {}).get("datePosted"),
+        "date_posted": ld.get("datePosted"),
         "home_type": me.get("accommodationCategory"),
         "beds": me.get("numberOfBedrooms"),
         "baths": me.get("numberOfBathroomsTotal"),
@@ -217,31 +337,22 @@ def listing_details(url):
         "lon": (me.get("geo") or {}).get("longitude"),
         "amenities": [a.get("name") for a in me.get("amenityFeature", [])],
         "photos": [i.get("url") for i in me.get("image", [])],
-        "description": (ld or {}).get("description", "").strip(),
+        "description": (ld.get("description") or "").strip(),
     }
-    # 2) ids for the detail APIs, from the page path. rf() raises after retries, and a missing
-    #    payload raises here too, so a failed endpoint never comes back as empty-looking fields.
-    path = urllib.parse.urlparse(url).path
-    p = rf("/stingray/api/home/details/initialInfo?" + urllib.parse.urlencode({"path": path})).get("payload") or {}
-    pid, lid = p.get("propertyId"), p.get("listingId")
-    if not pid:
-        raise RuntimeError(f"initialInfo returned no propertyId for {url}")
-    q = urllib.parse.urlencode({"propertyId": pid, "listingId": lid or "", "accessLevel": 1})
-    time.sleep(1)
-    atf = (rf("/stingray/api/home/details/aboveTheFold?" + q).get("payload") or {}).get("addressSectionInfo")
-    if not atf:
-        raise RuntimeError(f"aboveTheFold returned no addressSectionInfo for {url}")
+    # 2) the same page's embedded detail data (no extra requests)
+    st = json.loads(js(STATE_JS))
+    p = payload(st["info"], "initialInfo")
+    atf = payload(st["atf"], "aboveTheFold").get("addressSectionInfo")
+    if not isinstance(atf, dict):
+        raise RuntimeError("aboveTheFold has no addressSectionInfo on " + landed)
+    btf = payload(st["btf"], "belowTheFold")
     facts.update({
-        "property_id": pid, "listing_id": lid, "mls_id": p.get("mlsId"),
+        "property_id": p.get("propertyId"), "listing_id": p.get("listingId"), "mls_id": p.get("mlsId"),
         "status": (atf.get("status") or {}).get("displayValue"),
         "lot_sqft": atf.get("lotSize"),
         "price_per_sqft": atf.get("pricePerSqFt"),
         "full_baths": atf.get("numFullBaths"), "half_baths": atf.get("numPartialBaths"),
     })
-    time.sleep(1)
-    btf = rf("/stingray/api/home/details/belowTheFold?" + q).get("payload")
-    if btf is None:
-        raise RuntimeError(f"belowTheFold returned no payload for {url}")
     groups = {}
     for sg in (btf.get("amenitiesInfo") or {}).get("superGroups", []):
         for g in sg.get("amenityGroups", []):
@@ -264,160 +375,88 @@ Observed output (trimmed):
 
 ```text
 {
- "url": "https://www.redfin.com/TX/Austin/3305-Tavistock-Dr-78748/home/32017342",
- "address": {"@type": "PostalAddress", "streetAddress": "3305 Tavistock Dr", "addressLocality": "Austin",
-             "addressRegion": "TX", "postalCode": "78748", "addressCountry": "US"},
- "price": 599900, "availability": "InStock", "date_posted": "2026-10-23T14:21:36.420Z",
- "home_type": "Single Family Residential", "beds": 3, "baths": 2.5, "sqft": 2190, "year_built": 2007,
- "lat": 30.1699391, "lon": -97.8444657,
- "amenities": ["Heating & cooling: Has A/C", "Parking: 2 car garage"],
- "photos": "36 urls, first: https://ssl.cdn-redfin.com/photo/92/bigphoto/705/8807705_0.jpg",
- "property_id": 32017342, "listing_id": 224635318, "mls_id": "8807705",
- "status": "Active", "lot_sqft": 6638, "price_per_sqft": 274, "full_baths": 2, "half_baths": 1,
+ "url": "https://www.redfin.com/TX/Austin/503-S-Park-Dr-78704/home/31703545",
+ "address": {"@type": "PostalAddress", "streetAddress": "503 S Park Dr", "addressLocality": "Austin",
+             "addressRegion": "TX", "postalCode": "78704", "addressCountry": "US"},
+ "price": 1120000, "availability": "InStock", "date_posted": "2026-10-23T18:45:28.294Z",
+ "home_type": "Single Family Residential", "beds": 3, "baths": 2.5, "sqft": 1640, "year_built": 2023,
+ "lat": 30.232246, "lon": -97.7638868,
+ "amenities": ["Heating & cooling: Has A/C"],
+ "photos": "22 urls, first: https://ssl.cdn-redfin.com/photo/92/bigphoto/245/3820245_0.jpg",
+ "property_id": 31703545, "listing_id": 224677425, "mls_id": "3820245",
+ "status": "Active", "lot_sqft": 11704, "price_per_sqft": 683, "full_baths": 2, "half_baths": 1,
  "mls_details": {
-  "Garage/Carport Information": ["GARAGE_YN: Has Garage", "# of Garage Spaces: 2"],
-  "Parking": ["Features: Driveway, Garage", "# of Parking (Total): 4", "# of Covered Spaces: 2"],
+  "Bedroom Information": ["# of Main Level Bedrooms: 3"],
   "Bathroom Information": ["# of Full Bathrooms: 2", "# of Half Bathrooms: 1"],
+  "Room 1 Information": ["Level: First"],
+  "Laundry Information": ["Features: Inside"],
   ...
  }
 }
 ```
 
-Looping `listing_details()` over 8 Austin listings (condos, houses, one Coming Soon) with a 3 s pause took 8-11 s per listing and never got blocked. MLS groups seen: Parking, Bedroom/Bathroom Information, Room N Information, Laundry, Fireplace, Equipment, Interior/Exterior Features, Building Information, Green Features, Pool and Spa, Lot Information, Property Information, Assessments and Fees, Tax Information, Utility Information, Heating & Cooling, HOA Information, Community Information, Virtual Tour, plus one untitled group holding the public-record facts (Beds, Baths, Finished/Unfinished/Total Sq. Ft., Stories, Lot Size, Style, Year Built, Year Renovated, County, APN).
-
-### 3. Bulk search without a browser (plain Python)
-
-`/stingray/api/gis` answered plain urllib requests with 200 JSON using a truthful `User-Agent: browser-harness-skill-example` (no browser UA needed). Python's default `Python-urllib/3.x` UA got 429. Get `region_id` / `region_type` once from block 1, then page with this.
-
-```python
-import gzip, json, time, urllib.error, urllib.parse, urllib.request
-
-# region_id / region_type come from the browser block's resolve_region() output.
-# 34098 / 2 is ZIP 78704 (Austin, TX); 30818 / 6 is the city of Austin.
-REGION_ID, REGION_TYPE = 34098, 2
-PAGE_SIZE, PAUSE = 100, 2.0
-MAX_PAGES = 50              # safety cap (raises if hit)
-
-# A truthful client name. Python's default "Python-urllib/3.x" UA got 429 here; this one got 200.
-UA = "browser-harness-skill-example"
-
-def gis(start, tries=3):
-    """One page of homes. Retries with backoff (5 s, 10 s), then raises instead of returning a short page."""
-    q = {"al": 1, "ord": "redfin-recommended-asc", "sf": "1,2,3,5,6,7", "status": 9, "uipt": "1,2,3,4,5,6,7,8", "v": 8,
-         "region_id": REGION_ID, "region_type": REGION_TYPE, "num_homes": PAGE_SIZE, "start": start}
-    req = urllib.request.Request("https://www.redfin.com/stingray/api/gis?" + urllib.parse.urlencode(q),
-                                 headers={"User-Agent": UA, "Accept": "application/json", "Accept-Encoding": "gzip"})
-    for attempt in range(tries):
-        try:
-            with urllib.request.urlopen(req, timeout=60) as r:
-                body = r.read()
-                if r.headers.get("Content-Encoding") == "gzip":
-                    body = gzip.decompress(body)
-            text = body.decode("utf-8")
-            if text.startswith("{}&&"):
-                d = json.loads(text[4:])
-                homes = (d.get("payload") or {}).get("homes")
-                if d.get("resultCode") == 0 and homes is not None:
-                    return homes
-            err = "unexpected body: " + text[:120]
-        except (urllib.error.URLError, TimeoutError) as e:      # HTTPError (403/429/5xx) is a URLError
-            err = repr(e)
-        print(f"gis start={start} try {attempt + 1}/{tries} failed: {err}")
-        if attempt + 1 < tries:
-            time.sleep(5 * 2 ** attempt)
-    raise RuntimeError(f"gis start={start} failed {tries} times; if it keeps failing use the browser block")
-
-homes, seen = [], set()
-for page in range(MAX_PAGES):
-    batch = gis(page * PAGE_SIZE)
-    homes += [h for h in batch if h.get("propertyId") not in seen]
-    seen.update(h.get("propertyId") for h in batch)
-    print(f"page {page + 1}: {len(batch)} homes, {len(homes)} unique")
-    if len(batch) < PAGE_SIZE:          # a short successful page is the only end signal
-        break
-    time.sleep(PAUSE)
-else:
-    raise RuntimeError(f"hit MAX_PAGES={MAX_PAGES} with full pages; {len(homes)} homes so far. Raise MAX_PAGES and rerun.")
-
-v = lambda x: x.get("value") if isinstance(x, dict) else x
-for h in homes[:3]:
-    ll = v(h.get("latLong")) or {}
-    print(v(h.get("streetLine")), h.get("zip"), v(h.get("price")), h.get("beds"), h.get("baths"), v(h.get("sqFt")),
-          h.get("mlsStatus"), ll.get("latitude"), ll.get("longitude"), "https://www.redfin.com" + h.get("url", ""))
-```
-
-Observed output:
-
-```text
-page 1: 100 homes, 100 unique
-page 2: 100 homes, 200 unique
-page 3: 100 homes, 300 unique
-page 4: 32 homes, 332 unique
-2706 Nottingham Ln 78704 735000 3 2.0 1443 Active 30.2324635 -97.7518632 https://www.redfin.com/TX/Austin/2706-Nottingham-Ln-78704/home/31697330
-1818 Margaret St 78704 2995000 3 4.0 2767 Coming Soon 30.2581798 -97.7689286 https://www.redfin.com/TX/Austin/1818-Margaret-St-78704/home/31205095
-...
-```
+A second listing (ZIP 78745, 4 bed / 2.5 bath) gave 40 photo URLs and MLS groups Parking, Virtual Tour, Bedroom Information, Bathroom Information, Laundry Information and Equipment.
 
 ## Fields
 
-Search rows (`/stingray/api/gis` -> `payload.homes[]`). Many numeric fields are wrapped as `{"value": X, "level": 1}`; a wrapper with no `value` means hidden (seen for 17 Austin prices).
+Search rows. `source` says where the row came from: `embedded` (the search page's embedded map data, every field below) or `card` (a list card for a home outside the embedded 350; the fields marked "embedded only" are `null`). In the embedded data many numeric fields are wrapped as `{"value": X, "level": 1}`; a wrapper with no `value` means hidden.
 
-| Output field | Source in each home | Example |
-|---|---|---|
-| property_id | `propertyId` | `32017342` |
-| listing_id | `listingId` | `224635318` |
-| mls_id | `mlsId.value` | `"8807705"` |
-| address | `streetLine.value` (includes unit, e.g. `#1303`) | `"3305 Tavistock Dr"` |
-| city / state / zip | `city`, `state`, `zip` | `"Austin"`, `"TX"`, `"78748"` |
-| price | `price.value` (USD int) | `599900` |
-| beds / baths | `beds`, `baths` (also `fullBaths`, `partialBaths`) | `3`, `2.5` |
-| sqft | `sqFt.value` | `2190` |
-| lot_sqft | `lotSize.value` | `6638` |
-| year_built | `yearBuilt.value` | `2007` |
-| price_per_sqft | `pricePerSqFt.value` | `274` |
-| hoa_month | `hoa.value` | `48` |
-| days_on_market | `dom.value` | `1` |
-| status | `mlsStatus` | `"Active"`, `"Coming Soon"`, `"Price Change"` |
-| neighborhood | `location.value` | `"Bauerle Ranch"` |
-| lat / lon | `latLong.value.latitude/longitude` | `30.1699391`, `-97.8444657` |
-| url | `"https://www.redfin.com" + url` | `.../home/32017342` |
-| (not flattened) | `listingRemarks`, `keyFacts[].description`, `listingTags[]`, `sashes[].sashTypeName`, `numPictures`, `stories`, `isNewConstruction`, `uiPropertyType`, `timeZone` | `"Cowboy pool"`, `"NEW ROOF"`, `"New"` |
+| Output field | Embedded map data (`payload.homes[]`) | Card | Example |
+|---|---|---|---|
+| property_id | `propertyId` | `/home/<id>` in the card link | `31703545` |
+| listing_id, mls_id | `listingId`, `mlsId.value` | embedded only | `224677425`, `"3820245"` |
+| address | `streetLine.value` (includes unit, e.g. `#1303`) | JSON-LD `address.streetAddress` | `"503 S Park Dr"` |
+| city / state / zip | `city`, `state`, `zip` | JSON-LD `address` | `"Austin"`, `"TX"`, `"78704"` |
+| price | `price.value` (USD int) | JSON-LD `offers.price`, else the card price text | `1120000` |
+| beds / baths | `beds`, `baths` | card text `"3 beds"`, `"2.5 baths"` (floats; `null` on land cards, which say `"Land"`) | `3`, `2.5` |
+| sqft | `sqFt.value` | card text `"1,640 sq ft"` (float; `null` on land cards) | `1640` |
+| lot_sqft | `lotSize.value` | land cards only: `"0.38 acre (lot)"` (x 43,560) or `"9,557 sq ft (lot)"` | `11704` |
+| year_built, price_per_sqft | `yearBuilt.value`, `pricePerSqFt.value` | embedded only | `2023`, `683` |
+| hoa_month, days_on_market | `hoa.value`, `dom.value` | embedded only | `null`, `1` |
+| status | `mlsStatus` | embedded only | `"Active"`, `"Coming Soon"`, `"New"` |
+| neighborhood | `location.value` | embedded only | `"SOUTH PARK SEC 2"` |
+| lat / lon | `latLong.value.latitude/longitude` | JSON-LD `geo` | `30.232246`, `-97.7638868` |
+| url | `"https://www.redfin.com" + url` | card link | `.../home/31703545` |
+| source | `"embedded"` | `"card"` | |
+| (not flattened) | `listingRemarks`, `keyFacts`, `listingTags`, `sashes`, `numPictures`, `stories`, `isNewConstruction`, `uiPropertyType`, `timeZone` | | |
 
 Detail page:
 
 | Field | Source | Example |
 |---|---|---|
-| price, availability | JSON-LD `offers.price`, `offers.availability` | `599900`, `InStock` |
+| price, availability | JSON-LD `offers.price`, `offers.availability` | `1120000`, `InStock` |
 | address, geo | JSON-LD `mainEntity.address`, `mainEntity.geo` | PostalAddress dict |
-| home_type | JSON-LD `mainEntity.accommodationCategory` | `"Single Family Residential"`, `"Condominium"` |
-| beds, baths, sqft, year_built | JSON-LD `numberOfBedrooms`, `numberOfBathroomsTotal`, `floorSize.value`, `yearBuilt` | `3`, `2.5`, `2190`, `2007` |
-| photos | JSON-LD `mainEntity.image[].url` | 36 URLs, ~2172x1448 |
+| home_type | JSON-LD `mainEntity.accommodationCategory` | `"Single Family Residential"` |
+| beds, baths, sqft, year_built | JSON-LD `numberOfBedrooms`, `numberOfBathroomsTotal`, `floorSize.value`, `yearBuilt` | `3`, `2.5`, `1640`, `2023` |
+| amenities | JSON-LD `mainEntity.amenityFeature[].name` | `["Heating & cooling: Has A/C"]` |
+| photos | JSON-LD `mainEntity.image[].url` | 22 URLs |
 | description, date_posted | JSON-LD `description`, `datePosted` | full remarks text |
-| status | aboveTheFold `addressSectionInfo.status.displayValue` | `"Active"` |
-| lot_sqft, full/half baths | aboveTheFold `lotSize`, `numFullBaths`, `numPartialBaths` | `6638`, `2`, `1` |
-| mls_details | belowTheFold `amenitiesInfo.superGroups[].amenityGroups[].amenityEntries[]` | `{"Parking": ["# of Parking (Total): 4", ...]}` |
+| property_id, listing_id, mls_id | embedded initialInfo `propertyId`, `listingId`, `mlsId` | `31703545`, `224677425`, `"3820245"` |
+| status | embedded aboveTheFold `addressSectionInfo.status.displayValue` | `"Active"` |
+| lot_sqft, price_per_sqft, full/half baths | embedded aboveTheFold `lotSize`, `pricePerSqFt`, `numFullBaths`, `numPartialBaths` | `11704`, `683`, `2`, `1` |
+| mls_details | embedded belowTheFold `amenitiesInfo.superGroups[].amenityGroups[].amenityEntries[]` | `{"Laundry Information": ["Features: Inside"]}` |
 
 ## Gotchas
 
-- Do not `return fetch(...)` inside one `js()` call for big responses: a 350-home `gis` call usually finished in 1-4 s but once took longer, and `js()` raised `Runtime.evaluate timed out after 5s waiting for the daemon` mid-crawl. The `rf()` helper above starts the fetch, stores the text on `window`, and polls, which fixed it.
-- Every `/stingray` JSON response starts with `{}&&`. Strip 4 characters before `json.loads`; anything else in that position means you got an error page.
-- `page_number` does nothing: `page_number=2` returned the same first ids as page 1. Use `start=<offset>` (that is the parameter the site itself sends, as `start=0`). With `start` stepping by 350, Austin gave 5,793 unique ids with zero repeats.
-- `num_homes` is the page size. 350 is what the site sends; 500 and 2,000 also returned that many in a single call, but big responses are slow and heavy, so keep 350 and page.
-- `status=9`, `status=1` and `status=130` returned the identical 331 homes for ZIP 78704 (Active, Coming Soon, New). Results were only for-sale/coming-soon; no Pending or Sold rows appeared. Do not rely on `status` to switch to sold homes.
-- Price filters: `min_price` / `max_price` alone were ignored (prices from 106,900 to 14,699,000 came back for a 500k-600k request). They were applied when sent together with the extra `market=austin&mpt=99` parameters the site's own filter URL produced. Simplest: fetch everything, then filter the rows in Python.
-- `gis-aggregates` gives the site's headline count (`numProperties`, `numEarlyAccess`) and min/max/avg price for the same query; use it to sanity-check how many rows you should expect. It returned a count for the Austin city (5,793 + 120) and Travis County (9,474 + 145) but came back with `resultCode: 0, "Success"` and no payload for ZIP 78704, so treat it as optional.
-- ZIPs and neighborhoods have their own Redfin ids. Searching ZIP 78704 needs `region_id=34098, region_type=2`; neighborhood "East Austin" is `351579` with `region_type=1` (773 homes), and the same id with the city type returned an unrelated 3,169-home set. Always resolve via autocomplete.
-- City regions follow Redfin's boundary, not the mailing city: the Austin result included Del Valle (148), Pflugerville (74), Manor (30) and Cedar Park (23) addresses.
-- Some listings have `Undisclosed address` (18 in Austin) and no street line; lat/lon was still present.
-- Data-sharing restriction is per-MLS: the gis-csv download (see below) states "In accordance with local MLS rules, some MLS listings are not included in the download".
-- The page loads a OneTrust (cookielaw) consent script. None of the calls in this skill required dismissing anything.
-- Pacing used here: 2 s between search calls, 1 s between detail API calls, 3 s between detail pages. No 429 or block appeared at that rate (17 search calls back to back, 10 detail pages).
-- Selector drift: none of the code depends on CSS classes. The listing cards are rendered HTML with changing class names; prefer the JSON above.
+- The embedded data sits in an inline script as one line, `root.__reactServerState.InitialContext = {...};`, under `ReactServerAgent.cache.dataCache`. Each entry is keyed by the internal URL the server used to render the page and holds the response text with a `{}&&` prefix; strip 4 characters before `json.loads`. The skill only reads this from the page HTML it already loaded.
+- The embedded map data is capped at 350 homes and is the same on every `/page-<n>` (Austin page 1 and page 2 embedded the identical first 350). Only the list cards change from page to page.
+- The list comes in chunks of 350: every 9th page rendered only 22 cards (8 x 41 + 22 = 350). Austin had 16 such pages (9, 18, ..., 144) and ZIP 78745 had page 9; the next page carries on with the next chunk. In ZIP 78745, 5 of page 10's 24 cards repeated earlier ones, so keep the `property_id` dedupe.
+- The end of the list is not one fixed signal. In one probe Austin page-144 and page-146 redirected to `/city/30818/TX/Austin`; in the full crawls the list ran to page 149 and page 150 showed 41 cards that were all repeats. Block 1 stops on a redirect, on a page with no new homes, or once it has the header's count.
+- The site counts nearby homes: ZIP 78704's embedded data held 3 homes with ZIP 78745, and the header total (323 + 9 = 332) included them. ZIP 78745 gave 369 unique rows against a header of 365. City results follow Redfin's boundary, not the mailing city (Austin's first 350 included Pflugerville, Manchaca, Del Valle, Manor and Cedar Park addresses).
+- The header count moves while you crawl (Austin's header read 5,789 on one load and 5,786 on a later one the same afternoon), so block 1 allows a shortfall of `MAX_SHORT` (1%) and raises beyond that.
+- `goto_url()` on these pages often raised `Page.navigate timed out after 5s waiting for the daemon` while the page went on loading. The open helpers swallow that and poll the page instead, so a slow load is not mistaken for a failure.
+- There is no ZIP or city id lookup in this skill. ZIPs need no id (`/zipcode/78704`). City ids come from the address bar after searching on redfin.com by hand, or from the "Popular Cities" links on `/state/<State>` (16 cities on `/state/Texas`, including `/city/30818/TX/Austin`).
+- A card's JSON-LD is usually a list (`SingleFamilyResidence` or `Accommodation`, plus a `Product` with `offers.price`), but 3 of the 41 cards on Austin page 35 carried a single object with no `Product`. Block 1 accepts both and then takes the price from the card text.
+- Land cards put `Land` where beds go and the lot size where sqft goes (`0.38 acre (lot)`, `9,557 sq ft (lot)`); 7 of the 22 cards on Austin page 18 were land. Block 1 moves that number to `lot_sqft`.
+- Selectors: block 1 reads cards by `data-rf-test-name="basicNode-homeCard"` and the `bp-Homecard__*` class names (price, stats, address link). If cards stop being found, the block raises after its retries; check those names first.
+- The JSON-LD `datePosted` of the same listing changed in its milliseconds from load to load (`.271Z`, `.291Z`, `.294Z`), so do not use it as a change detector.
+- The page loads a OneTrust (cookielaw) consent script. Nothing in this skill required dismissing it.
+- Pacing used here: 3 s between search pages, one listing page at a time. No 429 or challenge page appeared in three back-to-back 150-page Austin crawls (about 15 minutes each), a partial one, and several dozen other page loads the same afternoon.
 
 ## What does not work
 
-- Plain HTTP (urllib, outside a browser) to `/stingray/do/location-autocomplete` and to `/stingray/api/home/details/aboveTheFold` / `belowTheFold`: 403 from CloudFront ("The request could not be satisfied"). The same calls returned 200 from inside a Redfin tab.
-- Plain HTTP to a listing detail page: 202 with an empty body (a bot-check interstitial, no data). Search HTML pages (`/city/...`, `/zipcode/...`) returned 200 once and then also 202 empty on a later request (`/zipcode/78704/page-2`). Use the browser for any HTML.
-- Plain HTTP with the bare `Mozilla/5.0` UA to `/city/30818/TX/Austin`: 403.
-- Search-page HTML is not a good bulk source anyway: a page carries one JSON-LD pair per card (41 on `/city/30818/TX/Austin/page-2` in the browser) (`SingleFamilyResidence` with address, geo, `numberOfRooms`, `floorSize`, plus a `Product` with `offers.price`), but no baths and no status.
-- `/stingray/api/gis-csv` (same query string) returned 200 `text/csv` with ADDRESS, PRICE, BEDS, BATHS, SQUARE FEET, STATUS, URL, LATITUDE, LONGITUDE columns from inside the tab, but warns that some MLS listings are excluded. The JSON endpoint is the more complete source.
+- Plain HTTP is blocked: `curl https://www.redfin.com/robots.txt` was redirected to `ratelimited.redfin.com` with status 429, so even robots.txt was read in the browser.
+- `/stingray/` (the JSON API behind the site's map, autocomplete and detail panels) is disallowed for `User-agent: *`. This skill does not call it; the pages' own scripts still use it while they render.
+- Typing into the home page search box from the cloud browser did nothing: the box sat in a container marked `disabled` and the typed text never landed, so the skill takes a ZIP or a search page path instead.
+- `/sitemap_com_city.xml` (listed in robots.txt) returned a CloudFront 403 "Request blocked" page in the browser, so it is not a way to look up city ids.
+- Fields only the embedded data has (status, year built, HOA, days on market, MLS id, and lot size except on land cards) are `null` on card rows; open those listings with block 2 if you need them.

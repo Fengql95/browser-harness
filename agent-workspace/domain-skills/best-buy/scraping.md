@@ -2,21 +2,28 @@
 
 Field-tested against www.bestbuy.com on 2026-10-23 using a Browser Use cloud browser (plain HTTP was tried too and does not work, see below).
 
+robots.txt (read in the browser on 2026-10-23; plain HTTP to it timed out like the rest of the site) does not disallow `/site/searchpage.jsp`, `/site/<sku>.p` or `/product/<slug>/<code>` for `User-agent: *`, but disallows any URL containing `cp=1` (so `cp=1` and `cp=10`-`19`), `cp=20`, or `cp=6` through `cp=9`. The search block therefore loads page 1 with no `cp` parameter, pages 2-5 with `cp=2` to `cp=5`, and stops there: pages 6-20 are disallowed. The product block uses `/site/<sku>.p?skuId=<sku>`, its redirect to `/product/<slug>/<code>`, and a search URL without `cp`.
+
 ## Quick summary
 
-- **Plain HTTP is a dead end.** `curl` and `http_get` to `www.bestbuy.com` never got a response: curl's default HTTP/2 request failed with a stream error (exit 92); HTTP/1.1 and `http_get` hit a 20 s read timeout with zero bytes, with both a bare `Mozilla/5.0` UA and a full Chrome UA. The official `api.bestbuy.com` returns `403 {"errorMessage":"We were unable to locate your API Key."}` without a key; if you can register a key at developer.bestbuy.com, that API is the stable source (see "What does not work").
-- **Use a real browser.** Search results (`/site/searchpage.jsp?st=<query>&cp=<page>`) and product pages render normally in a cloud browser, logged out, no CAPTCHA seen.
+- **Plain HTTP is blocked** (no status: curl's default HTTP/2 request failed with a stream error, exit 92; HTTP/1.1 and `http_get` hit a 20 s read timeout with zero bytes); this skill uses a normal browser session. The official `api.bestbuy.com` returns `403 {"errorMessage":"We were unable to locate your API Key."}` without a key; if you can register a key at developer.bestbuy.com, that API is the stable source (see "What does not work").
+- **Use a real browser.** Search results (`/site/searchpage.jsp?st=<query>` for page 1, `&cp=<2-5>` for pages 2-5) and product pages render normally in a cloud browser, logged out, no CAPTCHA seen.
 - **Search results are client-rendered and lazy.** Cards get prices only after they scroll into view, so scroll the page, then read the DOM cards (`.product-list-item[data-product-id]`). 20-24 cards per page, sponsored cards included.
 - **Product pages carry JSON-LD `Product`** (SKU, model, brand, price, availability, rating, review count, open-box offers). Full specs sit behind the "See all specifications" button; click it and read the sheet.
-- **The tab must be visible.** A background tab stayed on "Loading..." skeletons; `activate_tab(current_tab())` fixed it. The blocks only do that behind an explicit `FOREGROUND_TAB = True` opt-in (fine on a cloud browser); set it to `False` on your own Chrome and they raise on a hidden tab instead of taking over your screen.
+- **The blocks need a visible tab.** A hidden (background) tab stayed on "Loading..." skeletons, also with focus emulation and with `document.visibilityState` faked to `visible`; `activate_tab(current_tab())` fixed it. `new_tab()` opens a hidden tab, so run the blocks in a dedicated or cloud browser with `FOREGROUND_TAB = True`, which brings the tab to the front. The flag defaults to `False` so that on your own Chrome a hidden tab raises a clear error instead of taking over the window you are using.
 
 ---
 
 ## What works: search results across pages
 
-Title, SKU, price, sale price, rating, review count, availability and URL for 3 result pages of `gaming laptop`. Self-contained; opens one new tab.
+Title, SKU, price, sale price, rating, review count, availability and URL for result pages 1-5 of `gaming laptop`, the pages robots.txt allows. Self-contained; opens one new tab.
 
 ```python
+# NEEDS A VISIBLE TAB: Best Buy never renders a hidden (background) tab, and new_tab() opens a
+# hidden one. Run this in a dedicated or cloud browser with FOREGROUND_TAB = True, which brings
+# the tab to the front. Left False, a hidden tab raises instead of taking over your window.
+FOREGROUND_TAB = False
+
 import json, time
 from urllib.parse import quote_plus
 
@@ -74,26 +81,32 @@ def nav(url):
         cdp("Page.stopLoading", _response_timeout=30)
         cdp("Page.navigate", url=url, _response_timeout=30)
 
-# Best Buy never renders in a hidden (background) tab, and new_tab() opens a hidden one.
-# Bringing it to the front is an explicit opt-in: fine on a cloud browser, but on your own
-# Chrome it takes over the tab you are looking at. With False, a hidden tab raises instead.
-FOREGROUND_TAB = True
-
 def ensure_visible():
     if safe_js("document.visibilityState") == "visible":
         return
     if not FOREGROUND_TAB:
-        raise RuntimeError("tab is hidden and Best Buy will not render it: show the tab yourself or set FOREGROUND_TAB = True")
+        raise RuntimeError("tab is hidden and Best Buy does not render hidden tabs: run this in a dedicated or "
+                           "cloud browser with FOREGROUND_TAB = True (brings the tab to the front), or show the tab yourself")
     activate_tab(current_tab())
 
+# robots.txt (User-agent: *) disallows any URL containing cp=1 (cp=1, cp=10-19), cp=20 and cp=6..9.
+# Page 1 is the URL without cp; pages 2-5 are the only other pages it allows in sequence.
+ROBOTS_PAGES = (1, 2, 3, 4, 5)
+
+def search_url(query, page):
+    if page not in ROBOTS_PAGES:
+        raise ValueError(f"page {page}: robots.txt disallows cp={page} for User-agent: *")
+    url = f"https://www.bestbuy.com/site/searchpage.jsp?st={quote_plus(query)}"
+    return url if page == 1 else f"{url}&cp={page}"
+
 def load_search_page(query, page=1):
-    nav(f"https://www.bestbuy.com/site/searchpage.jsp?st={quote_plus(query)}&cp={page}")
+    nav(search_url(query, page))
     for _ in range(20):  # wait until product titles have rendered
         wait(1.5)
         if (safe_js("document.querySelectorAll('.product-list-item h3').length") or 0) > 0:
             break
         if safe_js("document.body.innerText.includes('unable to display products')"):
-            return [], None  # past the last page (or a transient error page)
+            return [], None, page  # past the last page (or a transient error page)
     # Cards and price blocks render lazily when they scroll into view.
     for _ in range(25):
         safe_js("window.scrollBy(0, 800)")
@@ -111,21 +124,28 @@ def load_search_page(query, page=1):
             wait(0.8)
         wait(1.5)
     cards = safe_js(EXTRACT_CARDS) or []
-    # listResult.count is sometimes {} and searchResultsNum is "" until hydrated: accept numbers only
-    total = safe_js("""(() => {
-      const c = ((window._BBY_DATA_ || {}).listResult || {}).count, n = (window.dioPageData || {}).searchResultsNum;
-      return Number.isFinite(c) ? c : Number.isFinite(n) ? n : null;
-    })()""")
-    return cards, total
+    # listResult.count is sometimes {} and searchResultsNum is "" or a numeric string: accept numbers only
+    meta = safe_js("""(() => {
+      const num = v => (v === '' || v === null || v === undefined || typeof v === 'object') ? null
+        : (Number.isFinite(Number(v)) ? Number(v) : null);
+      const lr = (window._BBY_DATA_ || {}).listResult || {}, d = window.dioPageData || {};
+      return {total: num(lr.count) ?? num(d.searchResultsNum), page: num(d.listPageNum) ?? num(lr.pageNumber)};
+    })()""") or {}
+    if meta.get("page") is not None and meta["page"] != page:  # confirms the cp-less URL is page 1
+        raise RuntimeError(f"asked for page {page}, Best Buy rendered page {meta['page']}")
+    return cards, meta.get("total"), meta.get("page")
 
 new_tab("about:blank")
 ensure_visible()
 
 query = "gaming laptop"
 all_items, seen = [], set()
-for page in range(1, 4):  # raise the cap for a full crawl
-    cards, total = load_search_page(query, page)
+for page in ROBOTS_PAGES:
+    cards, total, shown_page = load_search_page(query, page)
     if not cards:
+        if page == 1:
+            raise RuntimeError("page 1 returned no product cards")
+        print(f"page {page}: no products (past the last page, or an error page): stopping")
         break
     new = 0
     for c in cards:  # the same SKU can show up as a sponsored and an organic card
@@ -134,8 +154,13 @@ for page in range(1, 4):  # raise the cap for a full crawl
             c["page"] = page
             all_items.append(c)
             new += 1
-    print(f"page {page}: {len(cards)} cards, {new} new, {sum(c['price'] is not None for c in cards)} priced, total results {total}")
-    time.sleep(3)  # polite pacing between result pages
+    print(f"page {page} (site says page {shown_page}): {len(cards)} cards, {new} new, "
+          f"{sum(c['price'] is not None for c in cards)} priced, total results {total}")
+    if page != ROBOTS_PAGES[-1]:
+        time.sleep(3)  # polite pacing between result pages
+else:
+    print(f"stopped after page {ROBOTS_PAGES[-1]}: robots.txt disallows cp=6 to cp=20 for User-agent: *, "
+          f"so the rest of the {total} results are not fetched")
 
 from collections import Counter
 print(len(all_items), "unique products;", Counter(c["availability"] for c in all_items))
@@ -146,18 +171,23 @@ for item in all_items[:3]:
 Real output (trimmed, 2026-10-23):
 
 ```
-page 1: 24 cards, 19 new, 20 priced, total results 1233
-page 2: 24 cards, 21 new, 24 priced, total results 1233
-page 3: 24 cards, 20 new, 24 priced, total results 1233
-60 unique products; Counter({'in_stock': 51, 'unavailable': 5, None: 2, 'shop open-box': 2})
+page 1 (site says page 1): 24 cards, 20 new, 24 priced, total results 1232
+page 2 (site says page 2): 24 cards, 21 new, 24 priced, total results 1234
+page 3 (site says page 3): 24 cards, 18 new, 24 priced, total results 1234
+page 4 (site says page 4): 24 cards, 21 new, 24 priced, total results 1234
+page 5 (site says page 5): 24 cards, 24 new, 24 priced, total results 1234
+stopped after page 5: robots.txt disallows cp=6 to cp=20 for User-agent: *, so the rest of the 1234 results are not fetched
+104 unique products; Counter({'in_stock': 102, 'sold_out': 1, 'unavailable': 1})
 {"sku": "6674559", "title": "Alienware - 15.3\" 2K Gaming Laptop - AMD Ryzen 200 Series R7 260 2026 - 16GB Memory - NVIDIA GeForce RTX 5050 8GB - 1TB Storage - Black",
  "url": "https://www.bestbuy.com/product/alienware-15-3-2k-gaming-laptop-amd-ryzen-200-series-r7-260-2026-16gb-memory-nvidia-geforce-rtx-5050-8gb-1tb-storage-black/J3K4L6QR6V",
  "price": 1174.99, "regular_price": 1924.99, "on_sale": true, "savings": "Save $750", "rating": 4.6, "review_count": 38,
- "availability": "in_stock", "button": "Add to cart", "pickup": "Pick up Thu, Oct 29", "shipping": "Get it tomorrow • FREE",
+ "availability": "in_stock", "button": "Add to cart", "pickup": "Pick up in 1 hour", "shipping": "Get it tomorrow • FREE",
  "sponsored": false, "page": 1}
 ```
 
-Counts vary run to run: a second run of the same block minutes later gave 24/24 priced on every page and 60 products all `in_stock`. "Unavailable" and "Sold Out" cards still carry a price once they scroll into view: on an `rtx 5090` search, all 6 "Unavailable" cards on pages 1, 2, 3 and 6 had a price (e.g. $1,799.99, $799.99). `price` is `null` only when a card never rendered its price block, which happened to 1 of 16 cards on page 6 (it also had no button).
+So 5 pages give about 100 unique products; the other ~1,100 results sit on pages robots.txt disallows for `User-agent: *` (`cp=6` to `cp=20`). Narrow the query (or use the official API, below) when you need more than that. Page 1 has no `cp` in the URL; the block checks that the page the site reports (`dioPageData.listPageNum`, else `listResult.pageNumber`) matches the page it asked for and raises if not. Without `cp`, Best Buy rendered page 1 (`listPageNum` 1, the only pagination link pointing to `cp=2`), and `cp=2` shared 3 of about 20 SKUs with it, in line with the cross-page repeats noted under Gotchas.
+
+Counts vary run to run: an earlier run of pages 1-3 had 20 of 24 cards priced on page 1, and in another fresh-browser run page 1 came back with 14 of 24 priced and 9 cards that never rendered at all (`title` and `url` also `null`), even after the 3 revisit passes. Check the `priced` count per page. "Unavailable" and "Sold Out" cards still carry a price once they scroll into view: on an `rtx 5090` search, all 5 "Unavailable" cards on pages 1-3 had a price (e.g. $1,799.99, $799.99). `price` is `null` only when a card never rendered its price block.
 
 ### Search result fields
 
@@ -175,7 +205,7 @@ Counts vary run to run: a second run of the same block minutes later gave 24/24 
 | `pickup`, `shipping` | `[data-testid^="plp-pickup-messaging-"]`, `[data-testid^="plp-shipping-messaging-"]` | e.g. "Pick up in 1 hour", "Get it tomorrow • FREE", "Unavailable"; depends on the store Best Buy assigns to your IP |
 | `sponsored` | card is inside `li.slContainer` | Dedupe on `sku` |
 
-Page level: total result count is `window._BBY_DATA_.listResult.count` (sometimes an empty object), fallback `window.dioPageData.searchResultsNum` (an empty string until the page hydrates). The block takes whichever is a number, else `null`. `window._BBY_DATA_.skus` lists the page's SKUs in rank order with `isSponsored` flags before the cards finish rendering.
+Page level: total result count is `window._BBY_DATA_.listResult.count` (sometimes an empty object), fallback `window.dioPageData.searchResultsNum` (an empty string until the page hydrates; a number on one page, a numeric string like `"1234"` on another). The block takes whichever parses as a number, else `null`. The current page number is `dioPageData.listPageNum` (a number) or `listResult.pageNumber` (a string such as `"1"`). `window._BBY_DATA_.skus` lists the page's SKUs in rank order with `isSponsored` flags before the cards finish rendering.
 
 ---
 
@@ -184,6 +214,11 @@ Page level: total result count is `window._BBY_DATA_.listResult.count` (sometime
 Price, regular price, availability, rating, open-box offers and every spec row. Reuses the current tab, takes the organic SKUs from a live `laptop` search, and scrapes product pages until it has shown one discounted and one full-price product (about 30-50 s per product). Call `get_product(sku)` with any SKU from the search block.
 
 ```python
+# NEEDS A VISIBLE TAB, like the search block: in a hidden tab the main price block never renders.
+# Run it in a dedicated or cloud browser with FOREGROUND_TAB = True, which brings the tab to the
+# front. Left False, a hidden tab raises instead of taking over your window.
+FOREGROUND_TAB = False
+
 import json
 
 PRODUCT_LD = r"""(() => {
@@ -226,13 +261,12 @@ def nav(url):
         cdp("Page.stopLoading", _response_timeout=30)
         cdp("Page.navigate", url=url, _response_timeout=30)
 
-FOREGROUND_TAB = True  # explicit opt-in, same as the search block: a hidden tab never hydrates
-
 def ensure_visible():
     if safe_js("document.visibilityState") == "visible":
         return
     if not FOREGROUND_TAB:
-        raise RuntimeError("tab is hidden and Best Buy will not render it: show the tab yourself or set FOREGROUND_TAB = True")
+        raise RuntimeError("tab is hidden and Best Buy does not render hidden tabs: run this in a dedicated or "
+                           "cloud browser with FOREGROUND_TAB = True (brings the tab to the front), or show the tab yourself")
     activate_tab(current_tab())
 
 def click_button_named(name):
@@ -398,22 +432,23 @@ organic SKUs on page: ['6667483', '13214744', '12341769', '6673811', '6667482']
 | `on_sale` | `regular_price` present and above `price_block_price` | Works even when `price_type` is `None` |
 | `price_type`, `button_state` | `window._BBY_DATA_.skus` entry with `isPDP: true` and a non-null `priceType` (`priceType`, `primaryButtonState`) | Hydrates 10-20 s after JSON-LD, and a second `isPDP` entry with `priceType: null` can show up. On 1 of 6 laptops (`13214744`) it never hydrated within the 45 s wait, so both are `None`. Same entry has `unitPrice`, `altSellerPriceMin/Max`, `userGeneratedContent.ratingAverage/reviewsCount` |
 | `rating`, `review_count` | JSON-LD `aggregateRating.ratingValue` / `reviewCount` | |
-| `specs` | "See all specifications" sheet `[data-testid="brix-sheet-content"]`: each `h3` is a section, each direct child `div` is a row of label and value | Section "Other" holds `UPC`, `BSIN` (the code at the end of the product URL) and `SKU`. 52, 83 and 84 rows on the three laptops checked |
+| `specs` | "See all specifications" sheet `[data-testid="brix-sheet-content"]`: each `h3` is a section, each direct child `div` is a row of label and value | Section "Other" holds `UPC`, `BSIN` (the code at the end of the product URL) and `SKU`. 52, 83 and 84 rows on the three laptops checked. `specs` is `None` when the sheet did not open after 3 clicks: in one of two later fresh-browser runs that happened on the MacBook (`0 spec rows`), while the other run got its 52 rows |
 
 ### URL patterns
 
 | URL | Observed |
 |---|---|
-| `/site/searchpage.jsp?st=<url-encoded query>&cp=<page>` | Search results; Best Buy adds `id=pcat17071` itself |
+| `/site/searchpage.jsp?st=<url-encoded query>` | Search results, page 1; Best Buy sometimes adds `id=pcat17071` itself |
+| `/site/searchpage.jsp?st=<url-encoded query>&cp=<2-5>` | Pages 2-5. robots.txt disallows `cp=1` (and `cp=10`-`19`), `cp=6` to `cp=9` and `cp=20` for `User-agent: *`; the site's own pagination links also use `cp` |
 | `/site/<sku>.p?skuId=<sku>` | Redirects to the canonical `/product/<slug>/<code>` page |
 | `/product/<slug>/<code>` | Product page |
-| `cp` past the last page | "We're unable to display products at the moment", 0 cards. Example for `rtx 5090` (counts drift between runs): 104 results, 20 cards on pages 1-3, 16 on page 6, none on page 9 |
+| `cp` past the last page | "We're unable to display products at the moment", 0 cards. Example: `rtx 5090 founders edition` reported 24 results on page 1 and 30 on `cp=2` (12 cards), and `cp=3` showed the message with 0 cards |
 
 ---
 
 ## Gotchas
 
-- **Background tab means endless skeletons.** With `document.visibilityState == "hidden"` the search page stayed at "Main Content / Loading..." with 0 titles for 24 s (rechecked 2026-10-23). After `activate_tab(current_tab())`, titles rendered within 2 s. `activate_tab` brings the tab to the front, so the blocks call it only when `FOREGROUND_TAB = True`; that is safe on a cloud browser, while on your own Chrome you should set `False` and show the tab yourself. Keep one visible working tab and close extras.
+- **Background tab means endless skeletons.** With `document.visibilityState == "hidden"` the search page stayed at "Main Content / Loading..." with 0 titles and 0 prices for 24 s (rechecked 2026-10-23 in a fresh cloud browser). It stayed that way with `Emulation.setFocusEmulationEnabled(enabled=True)`, and also with `document.visibilityState` and `document.hidden` faked to `visible` / `false` by a script added before navigation. After `activate_tab(current_tab())`, titles rendered within 2 s. A hidden product page got its JSON-LD and `_BBY_DATA_` entry but no main price block in 30 s; it appeared within 2 s of activating the tab. So a visible tab is required, not optional. `activate_tab` brings the tab to the front, which is why the blocks call it only when you set `FOREGROUND_TAB = True` (do that in a dedicated or cloud browser); on your own Chrome leave it `False` and show the tab yourself. Keep one visible working tab and close extras.
 - **Busy main thread.** Right after navigation, `Runtime.evaluate` and `Page.navigate` sometimes exceeded browser-harness's 5 s IPC default (`Runtime.evaluate timed out`, `Page.navigate timed out after 5s`). `DOM.getBoxModel` timed out the same way while clicking "See all specifications". The blocks pass `_response_timeout=30` to those CDP calls and retry on `RuntimeError` or `TimeoutError` (browser-harness raises a `TimeoutError` subclass for IPC timeouts). Once a tab hung mid-navigation (title stuck as the URL, every evaluate timing out); `cdp("Page.stopLoading")` plus a new navigate recovered it, so `nav()` does exactly that when `Page.navigate` times out, and raises if the retry times out too.
 - **Lazy price blocks.** One top-to-bottom scroll left some cards unpriced; scrolling each unpriced card into view filled them in (24 of 24 on pages 2 and 3). The retry includes "Unavailable" and "Sold Out" cards, which do get a price block when in view; the loop gives up after 3 passes, so a card that never renders one keeps `price: null`.
 - **Hydration order on product pages.** JSON-LD is there first; the main price block and `_BBY_DATA_.skus` arrive later (the `isPDP` entry took 12-18 s in one trace, and once did not appear within 20 s). A "See all specifications" click before hydration did nothing, hence the wait and retry.
@@ -421,11 +456,12 @@ organic SKUs on page: ['6667483', '13214744', '12341769', '6673811', '6667482']
 - **Sponsored duplicates.** One SKU appeared as both a sponsored and an organic card on the same page, and a few SKUs repeat across `cp` pages. Dedupe on `sku`.
 - **Selector drift.** The site is a Next.js app with utility-class styling. Rely on `data-testid`, `data-product-id`, JSON-LD and `_BBY_DATA_`; avoid class names other than `product-list-item` and `slContainer`.
 - **No consent banner** appeared for the US cloud browser, so there is nothing to dismiss.
-- **Pacing.** About 40 page loads over roughly an hour from one session produced no block page or CAPTCHA. The search block sleeps 3 s between pages; do not go faster on larger crawls.
+- **Pacing.** About 40 page loads over roughly an hour from one session produced no block page or CAPTCHA. The search block sleeps 3 s between pages; do not go faster across many queries.
+- **Page depth.** robots.txt caps a `User-agent: *` crawl of one query at 5 pages (see the top). `search_url()` raises `ValueError` for any other page number rather than skipping ahead.
 
 ## What does not work
 
-- `http_get`, curl or urllib against `www.bestbuy.com` search or product pages: no response before timeout, with either user agent.
+- `http_get`, curl or urllib against `www.bestbuy.com` search or product pages: no response before timeout, so plain HTTP is blocked; this skill uses a normal browser session.
 - `api.bestbuy.com/v1/products(...)` without an API key: HTTP 403 `{"errorMessage":"We were unable to locate your API Key."}`. This is Best Buy's official, structured product API: developer.bestbuy.com has a "Get API Key" signup, and the documented form is `https://api.bestbuy.com/v1/products(search=laptop)?format=json&apiKey=<your key>` (the docs warn about per-second query limits). If you can register for a key, prefer it over scraping; it was not tested here because no key was used.
 - Embedded data on search pages: no `__NEXT_DATA__`, no JSON-LD, the Apollo SSR transport was empty and `self.__next_f` contained no `skuId`. Prices and fulfillment load through client-side POSTs to `/gateway/graphql` (operations such as `PriceBlockInit_Compact_GetProduct`); those were not replayed here, so read the rendered DOM.
 - Specs in the initial product page DOM: the UPC was absent from `document.body.innerText` until the sheet was opened.

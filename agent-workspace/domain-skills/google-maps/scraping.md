@@ -2,6 +2,8 @@
 
 Field-tested against www.google.com/maps on 2026-10-23 using a Browser Use cloud browser and plain HTTP (Python `urllib`, no browser).
 
+robots.txt (checked 2026-10-23) allows /maps/search/, /maps/place/ and /search?*tbm=map for all user agents; it disallows the rest of /search.
+
 ## Quick summary
 
 - **Best source: the `/search?tbm=map` JSON the page itself loads.** The logged-out search page HTML (`/maps/search/<query>`) contains a `<link href="/search?tbm=map&...">` preload URL. Fetching it returns JSON with 20 places per page, including name, rating, review count, categories, full address, phone, website, lat/lng, place_id and the full weekly hours. Paging is an `!8i<offset>` token in the `pb` parameter. No browser needed.
@@ -33,7 +35,9 @@ def get(url, tries=3):
                 if r.headers.get("Content-Encoding") == "gzip":
                     data = gzip.decompress(data)
                 return data.decode("utf-8")
-        except (urllib.error.URLError, TimeoutError):
+        except (urllib.error.URLError, ConnectionError, TimeoutError) as e:   # ConnectionError covers resets mid-read
+            if getattr(e, "code", None) in (403, 429):   # blocked or rate-limited: stop, never retry
+                raise RuntimeError(f"blocked: HTTP {e.code} on {url}; stop and back off") from e
             if i == tries - 1:
                 raise
             time.sleep(2 ** (i + 1))
@@ -160,8 +164,8 @@ How the pieces fit (all observed in this run):
 - The response starts with a `)]}'` guard line; JSON starts after the first newline.
 - `d[64]` is the result list. Each row is `[meta, place]` with a 260-element `place` list. All 528 rows over 3 queries (27 pages) were places; no sponsored or empty rows appeared. The code still skips any row without a place name, in case ads show up for other queries.
 - The preload URL already contains `!7i20` (page size), percent-encoded as `%217i20` in the served HTML. The page's own scroll requests add `!8i20`, `!8i40`, ... so the code inserts `!8i<offset>` right after `!7i20`, in whichever encoding the URL uses. If the token is missing, or a page adds no new places (offset ignored), it raises instead of re-reading page 1.
-- `get()` retries a failed request twice (2 s, then 4 s) and then raises, so a transient error never silently ends the list early.
-- User-Agent: the Python default, `curl/8.7.1` and `browser-harness-skill-example` all got the preload link and 20 rows per page, same as a Chrome UA. The only difference: non-browser UAs get each website as a `/url?q=<site>&...` redirect, which `parse_place` unwraps.
+- `get()` retries a failed request (URL errors, connection resets, timeouts) twice (2 s, then 4 s) and then raises, so a transient error never silently ends the list early. HTTP 403 or 429 means blocked or rate-limited: `get()` raises at once without retrying; stop and back off.
+- User-Agent: the Python default, `curl/8.7.1` and `browser-harness-skill-example` all got the preload link and 20 rows per page. Non-browser UAs get each website as a `/url?q=<site>&...` redirect, which `parse_place` unwraps.
 - Pages can overlap, so dedupe by `place_id`, not by name (chains such as "Epoch Coffee" have several locations with the same name).
 - `hours` keys start with today (the run was on a Friday, so `Friday` came first).
 
