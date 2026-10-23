@@ -28,7 +28,7 @@ robots.txt (checked 2026-10-23) on all 8 stores allows `/products.json`, `/produ
 
 ### 1. Full catalog via `/products.json` (plain Python, no browser)
 
-Stdlib only. Paginates until the empty page, reports the 25,000 cap when it stops there, retries 429/5xx and network errors with `Retry-After` (seconds or HTTP-date) or exponential backoff, stops if the server asks for more than 120 s, raises when retries run out, dedupes on product `id`, and writes one row per variant.
+Stdlib only. Paginates until the empty page, reports the 25,000 cap when the 400 body is the cap message (any other 400 raises), retries 429/5xx and network errors with `Retry-After` (seconds or HTTP-date) or exponential backoff, stops if the server asks for more than 120 s, raises when retries run out, dedupes on product `id`, and writes one row per variant.
 
 ```python
 import json, time, gzip, email.utils, urllib.request, urllib.error
@@ -36,6 +36,7 @@ from datetime import datetime, timezone
 
 STORE = "https://www.deathwishcoffee.com"   # any Shopify storefront origin, no trailing slash
 UA = "browser-harness-skill-example"        # a truthful client UA; every Online Store store tested returned 200 to it
+CAP_MSG = "Page * Limit exceeds the 25000 limit."   # the 400 body seen at the cap; any other 400 raises
 
 def retry_delay(value, attempt):
     """Retry-After is either delay-seconds or an HTTP-date; fall back to exponential backoff. Stop if asked to wait > 120 s."""
@@ -86,7 +87,7 @@ def fetch_catalog(store, limit=250, pause=1.0):
     products, page = [], 1
     while True:
         status, data = get_json(f"{store}/products.json?limit={limit}&page={page}")
-        if status == 400 and "25000" in str(data):
+        if status == 400 and CAP_MSG in str(data):
             print(f"hit the 25,000 product cap at page {page}; use the sitemap path for the rest")
             break
         if status != 200 or not isinstance(data, dict):
@@ -247,13 +248,14 @@ Use this when plain HTTP is blocked but a normal browser session loads the store
 import json, time
 
 STORE = "https://www.allbirds.com"
+CAP_MSG = "Page * Limit exceeds the 25000 limit."   # the 400 body seen at the cap; any other 400 raises
 
 PAGE_JS = """
 (async (page) => {
   let r;
   try { r = await fetch('/products.json?limit=250&page=' + page, {headers: {Accept: 'application/json'}}); }
   catch (e) { return JSON.stringify({status: 0, rows: null}); }   // network error
-  if (!r.ok) return JSON.stringify({status: r.status, rows: null});
+  if (!r.ok) return JSON.stringify({status: r.status, body: (await r.text()).slice(0, 200), rows: null});
   const d = await r.json();
   const rows = [];
   for (const p of d.products || []) for (const v of p.variants || []) rows.push({
@@ -279,11 +281,11 @@ while True:
             raise RuntimeError(f"page {page}: status {status} after 4 retries; catalog incomplete")
         time.sleep(2 ** retries)
         continue
-    if status == 400:
+    if status == 400 and CAP_MSG in res.get("body", ""):
         print(f"page {page}: 400 = 25,000 product cap; catalog truncated, use block 3 (sitemaps) for the rest")
         break
     if res["rows"] is None:
-        raise RuntimeError(f"page {page}: status {status} (403/404 = headless or blocked)")
+        raise RuntimeError(f"page {page}: status {status} {res.get('body', '')[:120]!r} (403/404 = headless or blocked)")
     retries = 0
     if res["products"] == 0:
         break
@@ -421,6 +423,7 @@ Extra in `/products/<handle>.js`: `price`, `price_min`, `price_max`, `compare_at
 - Default sort is not by id (Allbirds' list is in neither ascending nor descending id order). If the store edits products mid-crawl, rows can shift between pages; block 1 dedupes on `id` and reports any drops (the full crawls here had 0 duplicates).
 - Collections: `/collections.json?limit=250` lists collections with `products_count` (Death Wish: 126), and `/collections/<handle>/products.json` has the same shape. `/collections/all/products.json` returned the full 153 products. Some collections are empty (returned 0).
 - Error bodies are gzip-encoded when you send `Accept-Encoding: gzip`; decompress before reading the 400 cap message.
+- Not every 400 is the cap: `?page=abc` returned `400 {"errors":"expected String to be a Integer: page"}` on allbirds.com. Blocks 1 and 4 print the cap notice and stop only when the body contains `Page * Limit exceeds the 25000 limit.` and raise with the body for any other 400.
 - Unknown handles: `/products/<missing>.js` returns 404.
 - No browser User-Agent is needed: the truthful UA `browser-harness-skill-example` got 200 from every Online Store store and from both headless sitemaps. No 429 was observed (roughly 100 requests across 8 stores, paced 0.5-1 s apart), so keep that pace and honor `Retry-After` if one appears.
 - Prices are in the storefront's default currency (USD on every store tested; `window.Shopify.currency.active` shows it in the browser). The `.js` endpoint returns cents, the `.json` list returns decimal strings.

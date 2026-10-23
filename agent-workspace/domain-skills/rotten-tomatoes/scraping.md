@@ -224,30 +224,32 @@ if not complete:
 print(json.dumps(rows[0]) if rows else "no rows")
 
 # Enrich the first 5 with their title pages (review counts, rating, genre, dates, cast)
-failed = []
-for r in rows[:5]:
+todo, failed = rows[:5], []
+time.sleep(1.5)  # rt_browse does not sleep after its last page
+for i, r in enumerate(todo):
     if not r["url"]:
         failed.append((r["title"], "no url"))
         continue
     try:
         d = rt_title(r["url"])
+        print(json.dumps({k: d[k] for k in ("title", "tomatometer", "tomatometer_reviews", "popcornmeter",
+                                            "audience_ratings", "rating", "genres", "release_date", "cast")}))
     except urllib.error.HTTPError as e:
         if e.code in (403, 429):
             raise  # blocked, or still rate limited after rt_get's retries: stop the run and back off
         failed.append((r["url"], repr(e)[:80]))  # e.g. 404 for a removed title
-        continue
     except (OSError, LookupError, ValueError) as e:  # network error after retries, no data
         failed.append((r["url"], repr(e)[:80]))
-        continue
-    print(json.dumps({k: d[k] for k in ("title", "tomatometer", "tomatometer_reviews", "popcornmeter",
-                                        "audience_ratings", "rating", "genres", "release_date", "cast")}))
-    time.sleep(1.5)
-print("enriched", min(5, len(rows)) - len(failed), "of", min(5, len(rows)), "| failed:", failed)
+    finally:
+        if i < len(todo) - 1:
+            time.sleep(1.5)  # after every attempted request, failed ones included; not after the last
+print("enriched", len(todo) - len(failed), "of", len(todo), "| failed:", failed)
 
-# A movie, a TV series and a TV season directly, plus a full cast list
+# A movie, a TV series and a TV season directly, plus a full cast list (1.5 s before each request)
 for u in ["/m/oppenheimer_2023", "/tv/the_bear", "/tv/the_bear/s05"]:
-    print(json.dumps(rt_title(u)))
     time.sleep(1.5)
+    print(json.dumps(rt_title(u)))
+time.sleep(1.5)
 cast = rt_cast("/m/oppenheimer_2023")
 print(len(cast), "cast members", cast[:2])
 ```
@@ -482,7 +484,7 @@ The browser block's `rec` has `url, title, tomatometer, reviews, popcornmeter, a
 - **Browser call timeouts.** A slow `cdp` round trip raises a `TimeoutError` subclass, but `js` re-raises a timed-out `Runtime.evaluate` as `RuntimeError("Runtime.evaluate timed out; ...")`, so `except TimeoutError` alone misses it. `is_harness_timeout` accepts both; `open_page` and `js_retry` retry only those and re-raise real JS errors; other code lets them raise.
 - **Region redirects.** Bare `https://rottentomatoes.com/` redirects to `https://www.rottentomatoes.com/`. Title, browse and `/cnapi/` URLs returned HTTP 200 with no redirect from both vantage points used, but both were in the US (the site's OneTrust geolocation reported `"country":"US"` for the cloud browser and for the plain-HTTP network). Behavior from other countries was not tested; check `location.href` in the browser, or the `url` key `rt_title` returns (the final URL after redirects), if you run elsewhere.
 - **Selector drift.** The `data-qa="item-label"`/`item-value` and `cast-and-crew-card` markup are server-rendered web components. The embedded JSON (`media-scorecard-json`, JSON-LD) is the more stable source; prefer it when a field exists in both.
-- **Pacing.** About 45 HTTP requests at 1-1.5 s spacing returned no 429s or challenges. No published rate limit was found, so keep at least ~1 s between requests. `rt_get` retries 429/500/502/503/504 and network errors up to 4 tries, honoring `Retry-After` (seconds or HTTP-date) up to `MAX_WAIT` (120 s) or else backing off 2, 4, 8 s, then raises. A `Retry-After` above 120 s raises at once instead of sleeping, and there is no sleep after the last attempt. In `rt_browse` that raise ends the run; in the enrich loop of block 1 a title whose retries ran out is recorded in `failed` and the loop goes on to the next title, while the over-120 s raise (`RuntimeError`) is not caught and ends the run.
+- **Pacing.** About 45 HTTP requests at 1-1.5 s spacing returned no 429s or challenges. No published rate limit was found, so keep at least ~1 s between requests. `rt_get` retries 429/500/502/503/504 and network errors up to 4 tries, honoring `Retry-After` (seconds or HTTP-date) up to `MAX_WAIT` (120 s) or else backing off 2, 4, 8 s, then raises. A `Retry-After` above 120 s raises at once instead of sleeping, and there is no sleep after the last attempt. In `rt_browse` that raise ends the run; in the enrich loop of block 1 a title whose retries ran out is recorded in `failed` and the loop goes on to the next title after the same 1.5 s wait as a success, while the over-120 s raise (`RuntimeError`) is not caught and ends the run.
 - **User-Agent.** The HTTP block sends urllib's own truthful `Python-urllib/3.x` (no override), which got HTTP 200 on title, browse and `/cnapi/` URLs. It uses its own `rt_get` rather than the harness `http_get`, because `http_get` sends a browser-style `Mozilla/5.0` UA and does not retry.
 
 ## What does not work
