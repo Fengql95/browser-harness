@@ -68,7 +68,11 @@ def read_page(session, timeout=30):
             elif m == "Network.loadingFinished":
                 r = reqs[p["requestId"]]
                 if r.get("status") != 200:
-                    raise SystemExit(blocked(r.get("status"), "listing" if r["kind"] == "listing" else "fulfillment"))
+                    if r["kind"] == "listing":
+                        raise SystemExit(blocked(r.get("status")))
+                    if r.get("status") == 435:
+                        raise SystemExit(blocked(435, "fulfillment"))
+                    raise RuntimeError(f"fulfillment request HTTP {r.get('status')}")
                 data = body(session, p["requestId"])["data"]
                 if r["kind"] == "listing":
                     listing = data["search"]
