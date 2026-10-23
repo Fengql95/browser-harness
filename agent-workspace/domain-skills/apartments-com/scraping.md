@@ -1,13 +1,15 @@
 # Apartments.com — Rental listings and floor plans
 
-Field-tested against www.apartments.com on 2026-10-23 using a Browser Use cloud browser (plain `http_get`/curl was also tried and is blocked).
+Field-tested against www.apartments.com on 2026-10-23 using a Browser Use cloud browser.
+
+robots.txt (checked 2026-10-23 in the browser) allows the city search pages (`/austin-tx/`, `/austin-tx/2/`) and property pages this skill uses for all user agents; it disallows only `/mymedia/` and a few query parameters (`?ssk`, `?gclid`, `?rs`, ...).
 
 ## Quick summary
 
-- Plain HTTP is a dead end: `http_get`, curl with its default UA, a plain non-browser UA, or a full Chrome UA, and even `/robots.txt` all return **HTTP 403 "Access Denied"** from the Akamai edge. Use a real browser tab.
+- Plain HTTP is blocked (status 403 "Access Denied" from the Akamai edge, `/robots.txt` included); this skill uses a normal browser session.
 - In a browser, logged out, city search pages render fully server-side: **40 property cards per page**, no consent banner, no scrolling needed. Pagination is plain URLs: `/austin-tx/`, `/austin-tx/2/`, ... `/austin-tx/18/`.
-- Every search is capped at **700 results = 18 pages** (17 x 40 + 20), even when the title says "27,813 Rentals". Asking for `/austin-tx/19/` redirects to page 1. To go deeper, split the search (ZIP pages like `/austin-tx-78704/`, `/houses/austin-tx/`, neighborhoods).
-- Each card carries a `data-listing-share-lines` JSON array (street, city line, beds, baths, rent) plus the business phone in `phone-data`. Card amenities only exist on some ad tiers.
+- Every search is capped at **700 results = 18 pages** (17 x 40 + 20), even when the title says "27,813 Rentals". Asking for `/austin-tx/19/` redirects to page 1. The skill reads what the site serves and stops there.
+- Each card carries a `data-listing-share-lines` JSON array (street, city line, beds, baths, rent) plus a phone in `phone-data`. The code keeps the phone only for non-single-home tiers (see "Personal data"). Card amenities only exist on some ad tiers.
 - Property pages have a JSON-LD `RealEstateListing` node (phone, address, geo, rent low/high, rating, amenities, pets) and a server-rendered floor-plan grid with every unit, its base rent and total monthly price.
 - The CDN blocks the whole browser session after sustained crawling. Observed: about 40 page loads plus same-origin `fetch()` calls in 25 minutes, then every request (pages and fetch) returned "Access Denied". Keep at least 5 s between page loads and stop on the first "Access Denied".
 
@@ -22,10 +24,11 @@ Runs as-is with browser-harness helpers. Change `CITY` to any slug the site uses
 ```python
 import json, os, re, tempfile, time
 
-CITY = "austin-tx"   # slug from the site URL: austin-tx, chicago-il, austin-tx-78704, houses/austin-tx
+CITY = "austin-tx"   # slug from the site URL: austin-tx, chicago-il, houses/austin-tx
 MAX_PAGES = 3        # safety cap; the site serves at most 18 pages (700 results) per search
 PAUSE = 5            # seconds between page loads; see "Rate limits" below
 TRIES = 3            # navigation attempts per page
+MAX_BACKOFF = 120    # never sleep longer than this between attempts
 
 class Blocked(Exception):
     pass
@@ -68,13 +71,15 @@ def open_page(url, first=False):
                         raise RuntimeError(f"{url} redirected to {here}")
             time.sleep(0.5)
         print(f"{url} not loaded within 30 s; attempt {attempt}/{TRIES}")
-        time.sleep(PAUSE * attempt)
+        if attempt < TRIES:
+            time.sleep(min(PAUSE * attempt, MAX_BACKOFF))
     raise RuntimeError(f"could not load {url} after {TRIES} attempts (tab is at {here})")
 
 EXTRACT = r"""
 (() => {
   const clean = v => (typeof v === 'string' && v.replace(/\s+/g, ' ').trim()) || null;
-  const rows = [...document.querySelectorAll('article.placard[data-listingid]')].map(a => {
+  // .reinforcement = a repeat of an earlier card inserted mid-list; not counted in "Showing N"
+  const rows = [...document.querySelectorAll('article.placard[data-listingid]:not(.reinforcement)')].map(a => {
     const q = s => a.querySelector(s);
     const txt = s => clean(q(s)?.textContent);
     let share = [];
@@ -83,9 +88,12 @@ EXTRACT = r"""
       if (Array.isArray(v)) share = v;
     } catch (e) {}
     const rentLine = clean(share[7]) || '';
+    const tier = ([...a.classList].find(c => c.startsWith('tmpl-')) || '').replace('tmpl-', '') || null;
+    // basic-io / premiumplus are single homes, often individual landlords: do not collect their phone
+    const personal = ['basic-io', 'premiumplus'].includes(tier);
     return {
       listing_id: a.dataset.listingid || null,
-      tier: ([...a.classList].find(c => c.startsWith('tmpl-')) || '').replace('tmpl-', '') || null,
+      tier,
       name: txt('.property-title'),
       address: clean(q('.property-address')?.getAttribute('title'))
                || clean(q('[data-listing-address]')?.dataset.listingAddress)
@@ -97,7 +105,7 @@ EXTRACT = r"""
       rent_by_bed: [...a.querySelectorAll('.bedRentBox')].map(b => ({
         beds: clean(b.querySelector('.bedTextBox')?.textContent),
         rent: clean(b.querySelector('.priceTextBox')?.textContent)})),
-      phone: clean(q('.phone-link')?.getAttribute('phone-data')),
+      phone: personal ? null : clean(q('.phone-link')?.getAttribute('phone-data')),
       amenities: txt('.property-amenities'),
       url: q('a.property-link[href]')?.href.split(/[?#]/)[0] || null,
     };
@@ -140,7 +148,7 @@ while True:
     if page >= pages_total:
         print(f"complete: all {pages_total} pages, {total} results")
         if total == 700:
-            print("700 is the site's per-search cap; split the search to reach more")
+            print("700 is the site's per-search cap; it serves no results past it")
         break
     if page >= MAX_PAGES:
         print(f"stopped at MAX_PAGES={MAX_PAGES}: {pages_total - page} of {pages_total} pages not fetched")
@@ -197,6 +205,7 @@ CITY = "austin-tx"
 PROPERTY_URL = None   # e.g. a listing "url" from the search step; None = first result on the city page
 PAUSE = 5
 TRIES = 3
+MAX_BACKOFF = 120
 
 class Blocked(Exception):
     pass
@@ -239,7 +248,8 @@ def open_page(url, first=False):
                         raise RuntimeError(f"{url} redirected to {here}")
             time.sleep(0.5)
         print(f"{url} not loaded within 30 s; attempt {attempt}/{TRIES}")
-        time.sleep(PAUSE * attempt)
+        if attempt < TRIES:
+            time.sleep(min(PAUSE * attempt, MAX_BACKOFF))
     raise RuntimeError(f"could not load {url} after {TRIES} attempts (tab is at {here})")
 
 if not PROPERTY_URL:
@@ -302,10 +312,13 @@ PROPERTY = r"""
       })),
     };
   }).filter(Boolean);
+  // Phone only for apartment communities; single homes (SingleFamilyResidence etc.) are often individual landlords
+  const propertyType = str([].concat(me['@type'] || [])[0]);
   return {
     url: location.href.split(/[?#]/)[0],
     name: str(listing.name) || str(document.querySelector('h1')?.textContent),
-    phone: str(listing.telephone),
+    property_type: propertyType,
+    phone: propertyType === 'ApartmentComplex' ? str(listing.telephone) : null,
     address,
     lat: num(geo.latitude), lon: num(geo.longitude),
     rent_low: num(offers.lowPrice), rent_high: num(offers.highPrice),
@@ -342,6 +355,7 @@ Output observed (first Austin result at run time, trimmed):
 {
  "url": "https://www.apartments.com/ellwood-at-lake-travis-austin-tx/4v6169l/",
  "name": "Ellwood at Lake Travis",
+ "property_type": "ApartmentComplex",
  "phone": "+1-737-237-9124",
  "address": "7655 N Ranch Road 620, Austin, TX, 78726",
  "lat": 30.40643,
@@ -380,8 +394,8 @@ Search card (step 1):
 | `rent` | `data-listing-share-lines[7]` | `"$1,243 - $2,257"`, `"$2,300"` or `"Call for Rent"` |
 | `rent_includes_fees` | prefix `Total Monthly Price:` | True when the site shows rent plus required monthly fees instead of base rent |
 | `rent_by_bed` | `.bedRentBox` | List of `{beds, rent}`: per-bedroom "from" price as shown on the card |
-| `phone` | `.phone-link[phone-data]` | Digits only. 700/700 on Austin apartment pages; 76/80 on 2 pages of `/houses/austin-tx/` (missing on some `premiumplus` cards) |
-| `amenities` | `.property-amenities` | Comma string, tier-dependent: all `diamond`, no `platinum`/`gold` in Austin; 72/80 on the houses pages |
+| `phone` | `.phone-link[phone-data]` | Digits only. Set to null for `basic-io` and `premiumplus` (single homes, see "Personal data"). Present on all 700 Austin apartment search results |
+| `amenities` | `.property-amenities` | Comma string, tier-dependent: all `diamond`, no `platinum`/`gold` in Austin; 72/80 on 2 pages of `/houses/austin-tx/` |
 | `url` | first `a.property-link[href]` | Canonical property URL, query and hash stripped |
 
 Property page (step 2):
@@ -390,7 +404,8 @@ Property page (step 2):
 |---|---|---|
 | `url` | `location.href` | Query and hash stripped |
 | `name` | JSON-LD `name`, else `h1` | |
-| `phone` | JSON-LD `telephone` | `+1-737-...` format |
+| `property_type` | JSON-LD `mainEntity.@type` | `ApartmentComplex` for communities; a `premiumplus` house page had `SingleFamilyResidence` |
+| `phone` | JSON-LD `telephone` | `+1-737-...` format. Only kept when `property_type` is `ApartmentComplex`; null otherwise (house pages carry a phone too, often an individual landlord's) |
 | `address`, `lat`, `lon` | JSON-LD `mainEntity.address`, `.geo` | `lat`/`lon` are numbers or null |
 | `rent_low`, `rent_high` | JSON-LD `offers` (`AggregateOffer`) | Numbers, USD. Looks like base rent: Ellwood showed `951` here vs `$1,111` "Total Monthly Price" on the card |
 | `rating`, `rating_count` | JSON-LD `aggregateRating` | May be null |
@@ -405,20 +420,21 @@ JSON-LD `mainEntity.containsPlace` also lists units with bedrooms, bathrooms and
 
 ## Gotchas
 
-- **CDN block (Akamai).** Plain HTTP is always 403. In the browser, the session got "Access Denied" (title `Access Denied`, an `errors.edgesuite.net` reference) after sustained crawling, and same-origin `fetch()` from the page returned 403 too once that happened. `open_page` checks the title on every load and raises `Blocked` on the first one.
+- **CDN block (Akamai).** Plain HTTP is 403. In the browser, the session got "Access Denied" (title `Access Denied`, an `errors.edgesuite.net` reference) after sustained crawling, and same-origin `fetch()` from the page returned 403 too once that happened. `open_page` checks the title on every load and raises `Blocked` on the first one.
 - **Rate limits.** 18 consecutive page navigations at about 4.5 s spacing worked. The block came later in the session after extra rapid `fetch()` calls at 2 s spacing. Keep at least 5 s between loads and keep total volume modest.
-- **700-result cap.** Every search URL stops at page 18 even for 27,813 Austin rentals. Split by ZIP (`/austin-tx-78704/` showed 309 and later 318 results on the same day, 8 pages), by type (`/houses/austin-tx/`), or neighborhood to reach more.
-- **Filter slugs do not change the count shown.** `/austin-tx/2-bedrooms/` and `/austin-tx/under-1500/` load with their own titles but still say "Showing 40 of 700 Results", so the cap applies there too.
+- **700-result cap.** Every search URL stops at page 18 even for 27,813 Austin rentals. The site does not serve results past it; this skill does not try to work around it.
+- **Filter slugs keep the cap.** `/austin-tx/2-bedrooms/` and `/austin-tx/under-1500/` load with their own titles but still say "Showing 40 of 700 Results".
 - **Small searches have no pager.** `/alpine-tx/` showed 4 cards with no "Showing ..." line and no Next link; the code treats that as one complete page. `/marfa-tx/` had 0 cards.
 - **Card layout differs by tier.** Name, url, `data-listing-address` and the share-lines array (street, city line, beds, baths, rent) were present on all tiers seen; the `.property-address` element, phone, amenities and the "Total Monthly Price" label vary (`basic-io` single-home cards have no `.property-address`). The share-lines array is the most uniform source on the card, so the code reads beds/baths/rent from it instead of tier-specific markup.
+- **Repeated "featured" card.** `/houses/austin-tx/` page 1 had 41 `article.placard` nodes for "Showing 40": the diamond listing appeared again mid-list as a `featured-unit reinforcement` card with a different tier class. The extractor skips `.reinforcement`.
 - **Floor-plan tabs repeat plans.** The property page has tabs `all`, `bed0`, `bed1`, `bed2`... with the same plans again (Edison Austin: 50 `.pricingGridItem` nodes, 25 unique in `all`). Read only the `all` tab and dedupe by `data-rentalkey`.
 - **No lazy loading needed.** All 40 cards and every floor-plan unit are in the initial HTML; no scrolling or "show more" clicks were required.
 - **No consent or cookie banner** appeared on the search page screenshot, and nothing had to be dismissed before extraction.
-- **Personal data.** Single-home listings (`basic-io`, `premiumplus`) are often posted by individual landlords; their phone numbers are personal data. Keep phones only for management companies or drop them for those tiers.
+- **Personal data.** Single-home listings (`basic-io`, `premiumplus`) are often posted by individual landlords; their phone numbers are personal data. The search extractor returns `phone: null` for those tiers, and the property extractor keeps the phone only on `ApartmentComplex` pages.
 
 ## What does not work
 
-- `http_get` / curl / requests on any apartments.com URL, including `/robots.txt`: HTTP 403 "Access Denied" from the edge, with curl's default UA, a plain non-browser UA, or a full Chrome UA.
+- Plain HTTP (`http_get`, curl, requests) on any apartments.com URL, including `/robots.txt`: HTTP 403 "Access Denied" from the edge.
 - Paging past the cap: `/austin-tx/19/` redirects to `/austin-tx/`.
-- Continuing after a block: once "Access Denied" appeared, the next pages and in-page `fetch()` calls in the same session were also 403, and a single page load about 12 minutes later was still "Access Denied". The block did not lift within this test; budget for it rather than retrying.
-- Same-origin `fetch()` of other search pages from inside the tab (parsing with `DOMParser`) worked at first (status 200, 40 cards) but the session was blocked shortly after a burst of them at 2 s spacing. Plain `goto_url` navigation is the pattern that held up for a full 18-page crawl, so the code above uses it.
+- Continuing after a block: once "Access Denied" appeared, the next pages and in-page `fetch()` calls in the same session were also 403, and a single page load about 12 minutes later was still "Access Denied". On a block, stop and back off; do not retry in a loop.
+- Bursts of same-origin `fetch()` calls for other search pages (2 s spacing) were followed shortly by the session block. Plain page navigation at about 4.5 s spacing held up for a full 18-page crawl, so the code above uses it.

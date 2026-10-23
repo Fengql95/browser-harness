@@ -1,10 +1,12 @@
 # Realtor.com — For-sale listings and listing facts
 
-Field-tested against www.realtor.com on 2026-10-23 using a Browser Use cloud browser (plus `http_get` and `curl` probes, which were blocked).
+Field-tested against www.realtor.com on 2026-10-23 using a Browser Use cloud browser.
+
+robots.txt (checked 2026-10-23) allows `/realestateandhomes-search/<location>`, its `/pg-N` pages and `/realestateandhomes-detail/<slug>` for all user agents; it disallows `/realestateandhomes-search/*/*/pg-` (filters combined with pagination) and a few named listing slugs.
 
 ## Quick summary
 
-- Plain HTTP got **HTTP 429 Too Many Requests** on the first request to both search and detail pages, with a full Chrome UA (`http_get`) and with truthful client UAs (curl's default, `Python-urllib/3.12`). Realtor.com sits behind bot protection (the page root data includes a `kasadaScript` key). Use a real browser.
+- Plain HTTP is blocked (status 429 on the first request to search and listing pages); this skill uses a normal browser session.
 - **Search pages** (`/realestateandhomes-search/<City_ST or ZIP>[/pg-N]`) are a React Router app. All 42 results per page, plus the total count, sit in `window.__reactRouterDataRouter.state.loaderData.srp.search.value`. That object has price, beds, baths, sqft, status text, flags, broker and the listing slug. No DOM scraping needed.
 - **Listing pages** (`/realestateandhomes-detail/<slug>`) are a Next.js app. `__NEXT_DATA__` -> `props.pageProps.initialReduxState.propertyDetails` holds the full key facts (year built, HOA, price/sqft, days on MLS, lot, garage, stories, description, a categorized details list, estimate). JSON-LD (`RealEstateListing`) holds a smaller public subset.
 - From an open realtor.com tab, a same-origin `fetch()` of a listing URL returned 200 with `__NEXT_DATA__` in the HTML. That gives listing facts in batches without navigating the tab.
@@ -91,7 +93,8 @@ def load_page(url, first):
         d, last = read_srp(url)
         if d:
             return d
-        time.sleep(5 * 2 ** attempt)
+        if attempt + 1 < TRIES:      # no sleep after the last load
+            time.sleep(5 * 2 ** attempt)
     raise RuntimeError(f"no search data for {url} after {TRIES} loads; last seen: {last}")
 
 listings, seen, total, complete = [], set(), None, False
@@ -143,7 +146,7 @@ With `LOCATION = "78704"` and `MAX_PAGES = 12`, the same block walked the whole 
 
 This needs a www.realtor.com tab (block 1 leaves one open), because `fetch()` must be same-origin. It reads the saved `realtor_listings.json`, fetches each listing's HTML from inside the page and parses `__NEXT_DATA__`.
 
-The fetch is started in the page and polled, because one `js()` call gives up after about 5 s and a listing fetch can take longer. A 429, a 5xx, a network error or a page without listing data is retried with backoff (honoring `Retry-After` as seconds or an HTTP date). A response for a different property than requested counts as a failure. The block saves what succeeded, then raises with the list of listings that still failed, so a partial batch never looks complete.
+The fetch is started in the page and polled, because one `js()` call gives up after about 5 s and a listing fetch can take longer. A 429, a 5xx, a network error or a page without listing data is retried with backoff (honoring `Retry-After` as seconds or an HTTP date). Waits are capped at `MAX_WAIT_S` (120 s): if the server asks for longer, the block stops the batch, saves what it has and raises. It never sleeps after the last try. A response for a different property than requested counts as a failure. The block saves what succeeded, then raises with the list of listings that still failed, so a partial batch never looks complete.
 
 ```python
 import email.utils, json, os, tempfile, time, urllib.parse
@@ -151,6 +154,10 @@ import email.utils, json, os, tempfile, time, urllib.parse
 N = 5          # how many listings to enrich
 PAUSE_S = 2
 TRIES = 4      # fetches per listing before it counts as failed
+MAX_WAIT_S = 120  # longest Retry-After or backoff sleep; a longer ask stops the batch
+
+class WaitTooLong(Exception):
+    pass
 
 START_JS = r"""((url, key) => {
   window.__rdcFacts = window.__rdcFacts || {};
@@ -247,7 +254,12 @@ def get_facts(row):
             break                           # 404 and friends will not fix themselves
         if status == 200 and "/realestateandhomes-detail/" not in urllib.parse.urlsplit(r.get("final_url") or "").path:
             break                           # redirected away from the listing (seen for an unknown slug)
-        time.sleep(retry_after_s(r.get("retry_after"), 5 * 2 ** attempt))
+        if attempt + 1 == TRIES:
+            break                           # no retry left, so no sleep
+        wait = retry_after_s(r.get("retry_after"), 5 * 2 ** attempt)
+        if wait > MAX_WAIT_S:
+            raise WaitTooLong(f"{row['url']}: server asked to wait {wait:.0f}s (> {MAX_WAIT_S}s); stopping. last: {last}")
+        time.sleep(wait)
     raise RuntimeError(f"{row['url']}: {last}")
 
 if not on_realtor():
@@ -265,10 +277,14 @@ if not on_realtor():
 listings = json.load(open(os.path.join(tempfile.gettempdir(), "realtor_listings.json")))
 todo = [r for r in listings if r.get("url")][:N]
 print(f"{len(todo)} listings to enrich ({sum(1 for r in listings if not r.get('url'))} saved rows have no URL)")
-facts, failed = [], []
+facts, failed, stop = [], [], None
 for r in todo:
     try:
         f = get_facts(r)
+    except WaitTooLong as e:
+        stop = e
+        print("STOPPED", e)
+        break
     except RuntimeError as e:
         failed.append(str(e))
         print("FAILED", e)
@@ -279,6 +295,8 @@ for r in todo:
     time.sleep(PAUSE_S)
 json.dump(facts, open(os.path.join(tempfile.gettempdir(), "realtor_listing_facts.json"), "w"), indent=1)
 print(len(facts), "of", len(todo), "listings enriched")
+if stop:
+    raise stop
 if failed:
     raise RuntimeError(f"{len(failed)} of {len(todo)} listings failed after retries: {failed}")
 ```
@@ -358,7 +376,8 @@ def load_listing(want, tries=3, wait_s=20):
                     return item
             last = {k: s.get(k) for k in ("href", "ready", "error")}
             time.sleep(1)
-        time.sleep(5 * 2 ** attempt)
+        if attempt + 1 < tries:     # no sleep after the last load
+            time.sleep(5 * 2 ** attempt)
     raise RuntimeError(f"no RealEstateListing JSON-LD for {want}; last seen: {last}")
 
 def first_dict(v):
@@ -465,7 +484,7 @@ Block 3 prints `name`, `price`, `availability`, `beds`, `baths`, `sqft`, `year_b
 
 ## Gotchas
 
-- **No HTTP shortcut.** Plain HTTP got 429 on the first request for search and listing URLs, both with full Chrome headers and with truthful client UAs. A real browser loaded every page tried, about 30 navigations in the first run with 2-3 s pauses, with no challenge page and no 429.
+- **No HTTP shortcut.** Plain HTTP is blocked (status 429 on the first request for search and listing URLs); this skill uses a normal browser session. That session loaded every page tried, about 30 navigations in the first run with 2-3 s pauses, with no challenge page and no 429. If a challenge or a 429 does appear, stop and back off.
 - **The DOM is lazy.** Right after load, only 8-10 `[data-testid="property-card"]` cards were rendered (two loads), next to 32-34 `property-card-skeleton` placeholders. The count varies per load. The loader data already had all 42 rows, so read that, not the cards.
 - **Search JSON-LD lacks usable baths and status.** Search pages carry a `CollectionPage` -> `ItemList` of 42 `RealEstateListing` items with name, URL, price (as a string), beds, sqft, address and geo. A few items carry `numberOfBathroomsTotal` with an empty value (7 of 42 in one check); the rest have no baths key. There is no status and no total. The router loader data has all of them.
 - **`__NEXT_DATA__` on search pages is a stub** (`{"props":{"pageProps":{"geo":{"area_type":"city"}}}}`). Search moved to React Router. Listing pages still use Next.js.
@@ -482,7 +501,7 @@ Block 3 prints `name`, `price`, `availability`, `beds`, `baths`, `sqft`, `year_b
 
 ## What does not work
 
-- `http_get` / urllib / curl on `www.realtor.com` search or listing URLs: HTTP 429 on the first request, with a Chrome UA or a truthful client UA.
+- Plain HTTP (`http_get`, urllib, curl) on `www.realtor.com` search or listing URLs: blocked with HTTP 429 on the first request.
 - Reading listing cards from the DOM right after load: only 8-10 of 42 render until you scroll.
 - Search-page `__NEXT_DATA__`: empty stub, no listings.
 - Search-page JSON-LD alone: no usable baths, no status, no total.

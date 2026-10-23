@@ -2,13 +2,15 @@
 
 Field-tested against www.rottentomatoes.com on 2026-10-23 using plain HTTP (Python urllib) and a Browser Use cloud browser.
 
+robots.txt (checked 2026-10-23) has no rule for `/m/`, `/tv/`, `/browse/` or `/cnapi/browse/` (the paths this skill uses) and disallows `/search` for all user agents.
+
 ## Quick summary
 
 - **No browser needed for data.** Every title page (`/m/<slug>`, `/tv/<slug>`, `/tv/<slug>/s05`) ships the full scorecard as embedded JSON (`<script id="media-scorecard-json">`), plus one schema.org JSON-LD block and a server-rendered "Movie Info" list. Plain urllib with its default `Python-urllib/3.x` User-Agent returned HTTP 200 for all of them.
 - **Browse lists** (`/browse/<list>/<filters>`) are paginated by the same JSON endpoint the "Load more" button calls: `GET /cnapi/browse/<list>/<filters>?after=<endCursor>`, 30 items per page, cursor in `pageInfo`. 5 pages (150 unique titles) of one list in a row worked, ~0.2-1.1 s per call.
 - Browse items carry title, URL, Tomatometer, Popcornmeter, certified flags and a release-date string. Review counts, rating, genre, dates and cast come from the title page, so a full scrape is "browse, then one request per title".
 - The browser is only a fallback. Close the app-promo modal before clicking; do not click the consent banner's "Continue", it reloads the page.
-- `/search` is `Disallow`ed in robots.txt for all agents, so this skill never uses it. Start from browse lists or known `/m/` and `/tv/` URLs.
+- This skill does not use `/search`. Start from browse lists or known `/m/` and `/tv/` URLs.
 
 ## What works
 
@@ -21,9 +23,10 @@ import re, json, time, gzip, email.utils, html as htmllib
 import urllib.parse, urllib.request, urllib.error
 
 BASE = "https://www.rottentomatoes.com"
-# No User-Agent override: urllib sends its own "Python-urllib/3.x", which got HTTP 200 on every URL below.
+# No User-Agent override: urllib sends its own truthful "Python-urllib/3.x", which got HTTP 200 on every URL below.
 HDRS = {"Accept-Language": "en-US,en;q=0.9", "Accept-Encoding": "gzip"}
 RETRY_CODES = {429, 500, 502, 503, 504}
+MAX_WAIT = 120.0  # longest sleep we accept; a longer Retry-After stops the run instead
 TITLE_TYPES = {"Movie", "TVSeries", "TVSeason"}
 
 def _retry_after(v):
@@ -38,7 +41,8 @@ def _retry_after(v):
 
 def rt_get(url, tries=4, timeout=20):
     """GET -> (final_url, text). Retries 429/5xx and network errors with backoff, then raises.
-    Any other HTTP error (404 for a bad slug or list) raises at once."""
+    Any other HTTP error (404 for a bad slug or list) raises at once, and so does a
+    Retry-After longer than MAX_WAIT. Never sleeps after the last attempt."""
     for i in range(tries):
         try:
             with urllib.request.urlopen(urllib.request.Request(url, headers=HDRS), timeout=timeout) as r:
@@ -54,7 +58,9 @@ def rt_get(url, tries=4, timeout=20):
             if i == tries - 1:
                 raise
             wait = None
-        time.sleep(min(60.0, wait if wait is not None else 2.0 * 2 ** i))
+        if wait is not None and wait > MAX_WAIT:
+            raise RuntimeError(f"{url}: server asked to wait {wait:.0f}s (> {MAX_WAIT:.0f}s); stopping")
+        time.sleep(min(MAX_WAIT, wait if wait is not None else 2.0 * 2 ** i))
 
 def _script_json(page, attr):
     """Parse the first <script ...attr...>{JSON object}</script> block, or None."""
@@ -257,24 +263,29 @@ enriched 5 of 5 | failed: []
 31 cast members [{'name': '<name>', 'character': '<name>'}, {'name': '<name>', 'character': '<name>'}]
 ```
 
-The failure paths were checked against a local mock server the same day: a 429 with `Retry-After: 1` and a 503 with an HTTP-date `Retry-After` were each retried once and then succeeded; a server that always returned 500 made `rt_get` raise `HTTPError 500` after its tries; a browse page that kept failing made `rt_browse` raise instead of returning the rows it already had; a row with `emsId: null` was kept.
+The failure paths were checked against a local mock server the same day: a 429 with `Retry-After: 1` and a 503 with an HTTP-date `Retry-After` were each retried once and then succeeded; a 429 with `Retry-After: 300` made `rt_get` raise after 1 request with no sleep; a server that always returned 500 made `rt_get` raise `HTTPError 500` after its tries; a browse page that kept failing made `rt_browse` raise instead of returning the rows it already had; a row with `emsId: null` was kept.
 
 **List names and filters.** The path after `/browse/` on the site is exactly what `/cnapi/browse/` takes. Observed working: `movies_in_theaters/sort:popular`, `movies_at_home/critics:certified_fresh~sort:popular`, `movies_coming_soon/sort:popular`, `tv_series_browse/sort:popular`, `tv_series_browse/genres:comedy~sort:newest`. Multiple filters are joined with `~`. To get a filter string, set the filters on the site's browse page and copy the path. An unknown list name returns HTTP 404.
 
 ### 2. Browser fallback (same data from the live DOM, "Load more" pagination)
 
-Use only if HTTP is blocked from your network. It works in a background tab (`new_tab` does not foreground Chrome; nothing here calls `activate_tab`).
+Use this path when you want the rendered page in a normal browser session; it reads the same public, logged-out pages a visitor sees, at a human pace. It is not a way around a block: if either path gets a 403, 429, challenge or captcha, stop, record it and back off, and do not switch paths, sessions or networks to get past it. It works in a background tab (`new_tab` does not foreground Chrome; nothing here calls `activate_tab`).
 
 ```python
 import json, time
 
+def is_harness_timeout(e):
+    """js() re-raises a slow Runtime.evaluate as RuntimeError("Runtime.evaluate timed out; ...");
+    cdp() raises a TimeoutError subclass. Anything else (a JS exception) is a real error."""
+    return isinstance(e, TimeoutError) or (isinstance(e, RuntimeError) and "timed out" in str(e))
+
 def js_retry(expr, tries=3):
-    """js() that retries the harness's TimeoutError (slow daemon round trip on a busy cloud browser)."""
+    """js() that retries harness timeouts (slow daemon round trip on a busy cloud browser)."""
     for i in range(tries):
         try:
             return js(expr)
-        except TimeoutError:
-            if i == tries - 1:
+        except (TimeoutError, RuntimeError) as e:
+            if not is_harness_timeout(e) or i == tries - 1:
                 raise
             time.sleep(1)
 
@@ -291,8 +302,9 @@ def open_page(url, ready_selector, first=False, timeout=30):
         try:
             if js(check):
                 return
-        except TimeoutError:
-            pass
+        except (TimeoutError, RuntimeError) as e:
+            if not is_harness_timeout(e):
+                raise
         time.sleep(0.5)
     raise RuntimeError(f"{url} not ready ({ready_selector}): {json.dumps(page_info())}")
 
@@ -462,12 +474,11 @@ The browser block's `rec` has `url, title, tomatometer, reviews, popcornmeter, a
 - **App-promo modal blocks clicks.** An app-promo modal (`<rt-app-modal-content>`, close button `aria-label="Close"`, `data-rtappmanager="btnClose:click"`) did not appear on the first page view of a fresh browser but did appear on the second. While it was open, `elementFromPoint` at the "Load more" button returned the modal and the click added nothing (28 tiles stayed 28). Closing it does not reload the page. `close_app_promo()` clicks that exact element (`rt-app-modal-content [data-rtappmanager="btnClose:click"]`, an `<action-icon>`) only if it is visible, then confirms it went away; it never clicks some other "Close" button.
 - **Load more updates the URL.** Each click appends 30 tiles in place and rewrites the URL to `?page=2`, `?page=3` via history (same `timeOrigin`, no reload).
 - **Confirm the page before reading it.** Right after `goto_url` from the title page to a browse page, `location.href` was already the new URL but `readyState` was `loading`, then `interactive`; `wait_for_load()` alone only checks `readyState`, which can still be the old document's. `open_page()` waits for the requested URL, `complete`, and a page-specific selector together, and raises with `page_info()` instead of reading 0 tiles. Match AX button names case-insensitively.
-- **Browser call timeouts.** Harness calls (`js`, `cdp`) raise `TimeoutError` when the daemon round trip is slow. `open_page` and `js_retry` catch that and retry; other code lets it raise.
+- **Browser call timeouts.** A slow `cdp` round trip raises a `TimeoutError` subclass, but `js` re-raises a timed-out `Runtime.evaluate` as `RuntimeError("Runtime.evaluate timed out; ...")`, so `except TimeoutError` alone misses it. `is_harness_timeout` accepts both; `open_page` and `js_retry` retry only those and re-raise real JS errors; other code lets them raise.
 - **Region redirects.** Bare `https://rottentomatoes.com/` redirects to `https://www.rottentomatoes.com/`. Title, browse and `/cnapi/` URLs returned HTTP 200 with no redirect from both vantage points used, but both were in the US (the site's OneTrust geolocation reported `"country":"US"` for the cloud browser and for the plain-HTTP network). Behavior from other countries was not tested; check `location.href` in the browser, or the `url` key `rt_title` returns (the final URL after redirects), if you run elsewhere.
 - **Selector drift.** The `data-qa="item-label"`/`item-value` and `cast-and-crew-card` markup are server-rendered web components. The embedded JSON (`media-scorecard-json`, JSON-LD) is the more stable source; prefer it when a field exists in both.
-- **Pacing.** About 45 HTTP requests at 1-1.5 s spacing returned no 429s or challenges. No published rate limit was found, so keep at least ~1 s between requests. `rt_get` retries 429/500/502/503/504 and network errors up to 4 tries, honoring `Retry-After` (seconds or HTTP-date, capped at 60 s) or else backing off 2, 4, 8 s, then raises.
-- **User-Agent.** The HTTP block sends urllib's own `Python-urllib/3.x` (no override). It and a self-describing custom UA both got HTTP 200 on title and `/cnapi/` URLs; no browser-like UA was needed. It uses its own `rt_get` rather than the harness `http_get`, because `http_get` sends `Mozilla/5.0` and does not retry.
-- **robots.txt** disallows `/search`, `/m/*/pictures`, `/tv/*/pictures`, `/critics/self-submission/` and `/user/account/*` for all agents. Discover titles through browse lists instead of search.
+- **Pacing.** About 45 HTTP requests at 1-1.5 s spacing returned no 429s or challenges. No published rate limit was found, so keep at least ~1 s between requests. `rt_get` retries 429/500/502/503/504 and network errors up to 4 tries, honoring `Retry-After` (seconds or HTTP-date) or else backing off 2, 4, 8 s, then raises. A `Retry-After` above `MAX_WAIT` (120 s) raises at once instead of sleeping, and there is no sleep after the last attempt.
+- **User-Agent.** The HTTP block sends urllib's own truthful `Python-urllib/3.x` (no override), which got HTTP 200 on title, browse and `/cnapi/` URLs. It uses its own `rt_get` rather than the harness `http_get`, because `http_get` sends a browser-style `Mozilla/5.0` UA and does not retry.
 
 ## What does not work
 
@@ -476,3 +487,4 @@ The browser block's `rec` has `url, title, tomatometer, reviews, popcornmeter, a
 - Removed or wrong slugs (`/m/<bad_slug>`) return HTTP 404 (`urllib.error.HTTPError`, not retried); catch and skip.
 - Full cast is not on the main title page (JSON-LD has at most the top 5 names, sometimes 0); it needs the extra `/cast-and-crew` request.
 - Exact audience rating counts are not exposed for TV series, only banded text like `"10,000+ Ratings"`.
+- No 403, 429, challenge or captcha was seen on 2026-10-23 on either path. If one appears, stop and back off; neither block changes its client identity, session or network to get past it.

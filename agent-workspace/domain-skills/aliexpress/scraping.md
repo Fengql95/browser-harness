@@ -2,35 +2,38 @@
 
 Field-tested against `www.aliexpress.com` on 2026-10-23 using a Browser Use cloud browser (US exit) and plain HTTP (Python `urllib` from a US IP, no API key). All pages were logged out.
 
+robots.txt (checked 2026-10-23 on `www.aliexpress.com`) does not disallow `/w/` (search) or `/item/` (product) for `User-agent: *`, and disallows the whole site for named AI crawlers (GPTBot, ClaudeBot, CCBot, Google-Extended and others); `www.aliexpress.us/robots.txt` answered plain HTTP with a 302 cookie redirect.
+
 ## Quick summary
 
 - **Search results** (`/w/wholesale-<slug>.html?SearchText=...&page=N`) are server-rendered with every card's data in an inline `window._dida_config_._init_data_` object: title, product ID, sale and original price, sold count, star rating, sponsored flag, and for some cards the store name. 60 cards per page on broad queries.
 - **Welcome-deal cards have no `prices` object.** On "phone case" 15 to 32 of 60 cards per page were new-shopper "FREE with any purchase" cards with `prices: null`; on "mechanical keyboard" 0 of 60. Their amounts are only in the card's tracking map (`trace.utLogMap.salePriceAmount` / `originPriceAmount`, in cents). The code below falls back to that map and flags those rows with `welcome_deal: true` and `price_source: "tracking"`.
-- **Plain HTTP works for search pages** (about 830 KB of HTML per page, data embedded) with a truthful client User-Agent; a browser User-Agent was not needed. 6 pages at 3 s spacing returned 60 cards each, no captcha.
+- **Plain HTTP works for search pages** (about 830 KB of HTML per page, data embedded) with a truthful client User-Agent. 6 pages at 3 s spacing returned 60 cards each, no captcha.
 - **The browser works for search pages too** and reads the same object straight from `window`. Both paths repeat some products across pages, so dedupe by `product_id`.
 - **Stop on `zero_result`, not on a short page.** A narrow query returned 39 cards on page 1 (`totalResults` 40), then 60 cards on pages 2 and 3 (`totalResults` 438).
-- **Pagination stops at page 60.** `page=60` returned 60 cards; `page=61` and `page=100` returned `searchResultType: "zero_result"` with 0 cards, while page 60 of the same "phone case" query still reported `totalResults` 183,155. Max reachable per query and sort: 3,600 cards.
+- **Pagination stops at page 60.** `page=60` returned 60 cards; `page=61` and `page=100` returned `searchResultType: "zero_result"` with 0 cards, while page 60 of the same "phone case" query still reported `totalResults` 183,155. That is at most 3,600 cards per query.
 - **Product pages are client-rendered.** The HTML has no product data (`window.runParams` is empty). The page calls `acs.aliexpress.us/h5/mtop.aliexpress.pdp.pc.query`, a JSONP response with variants (SKUs), per-SKU price and stock, the default shipping option, store info, rating and specs. Read that response with CDP `Network.getResponseBody` in the browser.
-- **Product pages can be refused almost immediately.** In 3 fresh cloud browsers the product API first answered `FAIL_SYS_USER_VALIDATE` (slider captcha) on product page 1, on page 2, and not within 13 pages. Treat product pages as a small enrichment step, not a bulk source. Search pages kept working in the same browsers.
+- **Product pages can be refused almost immediately.** In 3 separate test sessions the product API first answered `FAIL_SYS_USER_VALIDATE` (slider captcha) on product page 1, on page 2, and not within 13 pages. Treat product pages as a small enrichment step, not a bulk source. Search pages kept working in the same browsers.
 - **Plain HTTP does not work for product pages**: both `www.aliexpress.com/item/<id>.html` and `www.aliexpress.us/item/<id>.html` failed with an infinite 302 redirect loop.
 
 ## What works
 
 ### 1. Search + pagination over plain HTTP (fastest)
 
-Plain Python, no browser: run it with `python3` or inside `browser-harness`. It uses `urllib` directly so it can read `Retry-After` on a 429. (The harness `http_get` routes through the fetch-use proxy when `BROWSER_USE_API_KEY` is set; that path was not tested here.)
+Plain Python, no browser: run it with `python3` or inside `browser-harness`. It uses `urllib` directly so it can read `Retry-After` on a 429.
 
 ```python
 import email.utils, gzip, http.client, json, re, time, urllib.error, urllib.parse, urllib.request
 
-# A truthful client UA returned the full search page on 2026-10-23; a browser UA was not needed.
+# Truthful client User-Agent; it returned the full search page on 2026-10-23.
 HEADERS = {
     "User-Agent": "browser-harness-skill/1.0 (+https://github.com/browser-use/browser-harness)",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
     "Accept-Encoding": "gzip",
 }
-SITE_MAX_PAGES = 60                       # AliExpress serves at most 60 pages per query and sort
+SITE_MAX_PAGES = 60                       # AliExpress serves at most 60 pages per query
+MAX_WAIT = 120                            # longest Retry-After / backoff sleep; a longer ask stops the run
 
 
 class SearchBlocked(RuntimeError):
@@ -56,7 +59,8 @@ def retry_after_seconds(value):
 
 
 def fetch(url, attempts=4, timeout=30):
-    """GET with backoff on 429, 5xx and network errors. Raises if every attempt fails."""
+    """GET with capped backoff on 429, 5xx and network errors. Raises if every attempt fails
+    or the server asks to wait longer than MAX_WAIT."""
     delay = 5
     for attempt in range(1, attempts + 1):
         try:
@@ -73,8 +77,10 @@ def fetch(url, attempts=4, timeout=30):
             wait, err = delay, e
         if attempt == attempts:
             raise RuntimeError(f"GET failed after {attempts} attempts: {url}") from err
+        if wait > MAX_WAIT:
+            raise RuntimeError(f"server asked to wait {wait:.0f}s (> {MAX_WAIT}s); stopping: {url}") from err
         print(f"  retry {attempt}/{attempts - 1} in {wait:.0f}s after {err!r}")
-        time.sleep(min(wait, 120))
+        time.sleep(wait)
         delay *= 2
 
 
@@ -219,7 +225,7 @@ present: {'price': 166, 'original_price': 153, 'sold': 159, 'sold_count': 159, '
 
 ### 2. Search + pagination in the browser
 
-Same data, read from `window` instead of the HTML. Use this when plain HTTP is blocked from your IP. `open_search` only parses once the tab's own URL carries the requested `SearchText` and `page` and that document is `complete`, so it never reads the previous page.
+Same data, read from `window` instead of the HTML, in a normal browser session. `open_search` only parses once the tab's own URL carries the requested `SearchText` and `page` and that document is `complete`, so it never reads the previous page.
 
 ```python
 import json, re, time, urllib.parse
@@ -355,14 +361,14 @@ Pass `sort=` to `search_url` / `search` / `search_in_browser` (it becomes `sortT
 | `price_asc` | Price low to high | 0.33, 0.33, 0.78, 0.86 | not counted |
 | `price_desc` | Price high to low | 765, 588.09, 465.69, 261.85 (a later run: 337.03, 261.29) | not counted |
 
-To get more than 3,600 products for one query, split it: run the same query with different `sortType` values, or narrower queries, and dedupe by `product_id`. Pass the same `normalize()` / `EXTRACT` over every sort. Popular sort had about half its cards as welcome deals, so any extractor that only reads `prices` loses price on half that sort.
+Pass the same `normalize()` / `EXTRACT` over every sort. Popular sort had about half its cards as welcome deals, so any extractor that only reads `prices` loses price on half that sort.
 
 ### 3. Product page: variants, per-variant price and stock, shipping, store
 
-Open the product page in the browser and read the page's own `mtop.aliexpress.pdp.pc.query` response from the network log. This block takes product IDs from a live search so it never depends on a delisted item. `capture_pdp` only returns a response whose `productId` equals the requested one.
+Open the product page in the browser and read the page's own `mtop.aliexpress.pdp.pc.query` response from the network log. This block takes product IDs from a live search so it never depends on a delisted item. `search_ids` only reads a completed document whose own URL carries the requested query parameters, and `capture_pdp` only returns a response whose `productId` equals the requested one.
 
 ```python
-import json, re, time
+import json, re, time, urllib.parse
 
 class ProductAPIRefused(RuntimeError):
     """The product API answered with a captcha ("punish") instead of data. Stop and wait."""
@@ -479,7 +485,8 @@ def parse_pdp(r):
     }
 
 def search_ids(url, timeout=30):
-    """Open a search page and return its product IDs, after confirming the tab is on that URL."""
+    """Open a search page and return its product IDs, after confirming the tab shows that URL's query."""
+    want = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
     goto_url(url)
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -492,7 +499,8 @@ def search_ids(url, timeout=30):
                       ids: Array.isArray(c) ? c.map(x => x && x.productId).filter(x => typeof x === 'string') : null}; })())"""))
         except (TimeoutError, RuntimeError):
             continue
-        if res["href"].startswith(url.split("?")[0]) and res["ready"] == "complete":
+        got = urllib.parse.parse_qs(urllib.parse.urlsplit(res["href"]).query)
+        if res["ready"] == "complete" and all(got.get(k) == v for k, v in want.items()):
             if res["ids"] is None:
                 raise RuntimeError(f"search page has no _init_data_: {res['href']}")
             return res["ids"]
@@ -539,7 +547,7 @@ Observed output (one of the 3 products, trimmed):
  "n_variants": 5, "n_images": 6, "n_specs": 15}
 ```
 
-The final line of that run was `parsed 3 of 3; no response: []; refused at: None`. The third product had a variant with `"stock": 0, "salable": false`. In another fresh cloud browser the same block was refused on its first product and stopped cleanly:
+The final line of that run was `parsed 3 of 3; no response: []; refused at: None`. The third product had a variant with `"stock": 0, "salable": false`. In another test session the same block was refused on its first product and stopped cleanly:
 
 ```
 3256806808315712 product API refused: ['FAIL_SYS_USER_VALIDATE', 'RGV587_ERROR::SM::...'] - stopping; wait several minutes before more product pages
@@ -603,7 +611,7 @@ Page-level: `fields.pageInfo` has `totalResults`, `page`, `pageSize` (60), `sear
 - **Some product pages aggregate several merchants.** One AJAZZ page carried a compliance note saying it aggregates "reviews and sales volume of similar items offered by multiple overseas merchants". `reviews` and `sales_text` can cover more than one seller; `store_name` is the merchant currently selected.
 - **Welcome-deal cards hide their price.** Logged out, many cards are new-shopper offers: the rendered card shows `"FREE with any purchase"` instead of a price, links to `/ssr/300001493/welcomegiftspmpc?...productIds=<1005 id>`, and has `prices: null` in `_init_data_`. The amounts are only in `trace.utLogMap` as integer-cent strings: `salePriceAmount` (e.g. `"109"`), `originPriceAmount`, `sellerOfferPriceAmount`. On the 228 priced cards where `salePriceAmount` was present it equalled `prices.salePrice.cent` every time, and `originPriceAmount` matched `originalPrice.minPrice` on 224 of 228. On 2 welcome-deal product pages opened logged out, every variant's price was `$1.09`, the same as their `salePriceAmount`. Treat it as the logged-out new-shopper price; keep `price_source` / `welcome_deal` so you can filter these rows out. 1 of 119 null-price cards had no `salePriceAmount`, so `price` can still be `None`.
 - **`utLogMap.quotaCurrencyCode` is not the display currency.** It said `CNY` on 49 of 60 cards whose prices were in USD cents. Take the currency from `prices.salePrice.currencyCode` of any priced card on the page, else from `pageInfo.trace.utLogMap.currency` (what `normalize` does).
-- **Store name on search cards is partial.** It comes from an ad-tracking field (`p4pExtendParam`) and was on 66 to 88 of about 170 unique cards across runs. For a reliable store name, open the product page (`SHOP_CARD_PC.storeName`).
+- **Store name on search cards is partial.** It comes from an ad-tracking field (`p4pExtendParam`) and was on 66 to 90 of about 170 unique cards across runs. For a reliable store name, open the product page (`SHOP_CARD_PC.storeName`).
 - **`sold` is display text** with rounding (`"10,000+ sold"`, `"600+ sold"`, `"32 sold"`). `sold_count` (`utLogMap.real_trade_count`) is the exact number; it agreed with `sold` (equal, or at least the `N+` floor) on 343 of 349 cards that had both.
 - **Results reshuffle between requests.** `totalResults` changed between pages of the same query (83,301 -> 83,208 -> 83,274 in the browser), and both plain HTTP and the browser repeated products from earlier pages (3 to 11 per page). Dedupe by `product_id`.
 - **A short page is not the end.** "ajazz ak820 pro gift purple red switch" returned 39 cards on page 1 with `totalResults` 40, then 60 cards on pages 2 and 3 with `totalResults` 438. Only an empty `zero_result` page ends a search.
@@ -611,9 +619,9 @@ Page-level: `fields.pageInfo` has `totalResults`, `page`, `pageSize` (60), `sear
 - **Product data is not in the DOM or HTML.** `window.runParams` is `{}` and `window._d_c_.DCData` only has image lists. Do not scrape CSS classes; read the API response.
 - **The event buffer is small.** The harness daemon keeps the last 500 CDP events. A product page fires about 400 network responses, so a single `drain_events()` after load missed the API response. Poll `drain_events()` every 0.25 s while the page loads (as in `capture_pdp`).
 - **No consent banner or login wall** appeared on search or product pages from the US cloud browser.
-- **The product API refuses early and unpredictably.** The first refusal came at a different point in each fresh cloud browser on 2026-10-23: on the 1st product page in one (after only 1 search page), on the 2nd in another, and not within 13 product pages about 9 s apart in a third. A refusal is `ret: ["FAIL_SYS_USER_VALIDATE", "RGV587_ERROR::SM::..."]`. The page then rendered only header and footer (title just the tab marker) plus an iframe at `acs.aliexpress.us//h5/mtop.aliexpress.pdp.pc.query/1.0/_____tmd_____/punish?x5secdata=...`, which is a slider captcha. Search pages kept working in the same browser, and in one browser the product refusal was still in place 8 minutes later. Do not solve or bypass it: stop, wait, and lower your rate (`capture_pdp` raises `ProductAPIRefused` so the loop stops on the first refusal). Get prices, sold counts and ratings from search cards, and open product pages only for the few items that need variants, stock or shipping.
+- **The product API refuses early and unpredictably.** The first refusal came at a different point in each of 3 test sessions on 2026-10-23: on the 1st product page in one (after only 1 search page), on the 2nd in another, and not within 13 product pages about 9 s apart in a third. A refusal is `ret: ["FAIL_SYS_USER_VALIDATE", "RGV587_ERROR::SM::..."]`. The page then rendered only header and footer (title just the tab marker) plus an iframe at `acs.aliexpress.us//h5/mtop.aliexpress.pdp.pc.query/1.0/_____tmd_____/punish?x5secdata=...`, which is a slider captcha. Search pages kept working in the same browser, and in one browser the product refusal was still in place 8 minutes later. Do not solve or bypass it: stop, wait, and lower your rate (`capture_pdp` raises `ProductAPIRefused` so the loop stops on the first refusal). Get prices, sold counts and ratings from search cards, and open product pages only for the few items that need variants, stock or shipping.
 - **First product request in a new browser can fail with `FAIL_SYS_TOKEN_EMPTY::令牌为空`.** The page then sets its token cookie and repeats the same API call, which succeeds. `capture_pdp` skips token errors and waits for the repeat; do not treat that first response as a block.
-- **Pacing.** Keep at least 3 s between search pages and more between product pages, and stop on the first page without `_init_data_` or the first API refusal instead of retrying in a loop. `fetch` only retries 429, 5xx and network errors, honoring `Retry-After`; none of those were seen on 2026-10-23.
+- **Pacing.** Keep at least 3 s between search pages and more between product pages, and stop on the first page without `_init_data_` or the first API refusal instead of retrying in a loop. `fetch` only retries 429, 5xx and network errors, honoring `Retry-After` up to 120 s and stopping if asked to wait longer; none of those were seen on 2026-10-23.
 - **The tabs stay in the background.** Nothing here calls `activate_tab`; search and product pages loaded and fired their API calls in a background tab of the cloud browser.
 
 ## What does not work

@@ -2,6 +2,8 @@
 
 Field-tested against apps.apple.com and itunes.apple.com on 2026-10-23 using a Browser Use cloud browser (and plain HTTP).
 
+robots.txt (checked 2026-10-23): itunes.apple.com disallows `/search*` for all user agents and does not disallow `/lookup`; apps.apple.com does not disallow `/<country>/app/` pages and disallows `*/search?*`.
+
 ## Quick summary
 
 - Use the public **iTunes Search/Lookup API** first. No key, no cookies, JSON out:
@@ -10,9 +12,9 @@ Field-tested against apps.apple.com and itunes.apple.com on 2026-10-23 using a B
 - One API record already has name, developer, average rating, ratings count, price, category, size in bytes, current version, current-version release date and its release notes.
 - The app page (`https://apps.apple.com/us/app/id<ID>`) adds what the API lacks: 5-to-1 star histogram, top-chart rank, the new age rating (13+, 9+), and the **25 most recent versions** with dates and notes. It is server-rendered JSON in `<script id="serialized-server-data">`, readable with a plain HTTP GET (status 200).
 - In a browser the SPA removes that script after hydration, so re-fetch the page HTML from inside the tab (block 4).
-- Search has **no working pagination**: `offset` does not page, `limit` caps at 200. A search result is Apple's top list for that term, not every matching app. Widen coverage with more terms or more storefronts (`country=`), then dedupe by `trackId`.
-- Polite pacing that never failed here: 1 request per second for 20 lookups in a row, all HTTP 200. The code below sleeps 3 s between calls, retries 403/429/5xx and network errors with backoff (honoring `Retry-After` as seconds or HTTP-date when present), and raises if a call still fails. It never returns a failed call as an empty result.
-- Plain HTTP uses a truthful `Python-urllib/3.x` User-Agent. Both hosts answered it with HTTP 200 today, so no browser-like UA is needed.
+- Search has **no working pagination**: `offset` does not page, `limit` caps at 200. A search result is Apple's top list for that term, not every matching app. Separate topics are separate terms; dedupe their overlap by `trackId`.
+- Apple's Search API docs state a limit of about 20 calls per minute. The code below sleeps 3 s between calls, retries 429/5xx and network errors with backoff (honoring `Retry-After` as seconds or HTTP-date), stops and raises if the server asks for more than 120 s, and raises on 403 or any other failure. It never returns a failed call as an empty result.
+- Plain HTTP uses a truthful `Python-urllib/3.x` User-Agent. Both hosts answered it with HTTP 200 today.
 
 ## What works
 
@@ -24,7 +26,8 @@ Plain Python, no browser needed.
 import email.utils, json, sys, time, urllib.error, urllib.parse, urllib.request
 
 UA = f"Python-urllib/{sys.version_info.major}.{sys.version_info.minor}"  # truthful client UA
-RETRY = {403, 429, 500, 502, 503, 504}
+RETRY = {429, 500, 502, 503, 504}  # 403 and other statuses are not retried
+MAX_WAIT = 120  # longest backoff this code sleeps; a longer Retry-After stops the run
 
 def retry_after(e, default):
     """Seconds to wait: Retry-After as seconds or HTTP-date, else the default backoff."""
@@ -39,8 +42,8 @@ def retry_after(e, default):
     return default
 
 def fetch(url, retries=4):
-    """GET url and return the body text. None only for HTTP 404. Retries 403/429/5xx and
-    network errors with backoff, then raises: a failed call never looks like an empty result."""
+    """GET url and return the body text. None only for HTTP 404. Retries 429/5xx and network
+    errors with capped backoff, then raises: a failed call never looks like an empty result."""
     for attempt in range(retries):
         try:
             req = urllib.request.Request(url, headers={"User-Agent": UA})
@@ -51,7 +54,10 @@ def fetch(url, retries=4):
                 return None
             if e.code not in RETRY or attempt == retries - 1:
                 raise
-            time.sleep(min(retry_after(e, 15 * (attempt + 1)), 120))
+            wait = retry_after(e, 15 * (attempt + 1))
+            if wait > MAX_WAIT:
+                raise RuntimeError(f"{url}: server asked to wait {wait:.0f} s (> {MAX_WAIT} s); stopping") from e
+            time.sleep(wait)
         except OSError:  # URLError, timeouts, connection resets
             if attempt == retries - 1:
                 raise
@@ -157,7 +163,8 @@ Finch: Self-Care Pet | Finch Care Public Benefit Corporation | 4.95 | 766844 | F
 import email.utils, json, sys, time, urllib.error, urllib.parse, urllib.request
 
 UA = f"Python-urllib/{sys.version_info.major}.{sys.version_info.minor}"  # truthful client UA
-RETRY = {403, 429, 500, 502, 503, 504}
+RETRY = {429, 500, 502, 503, 504}  # 403 and other statuses are not retried
+MAX_WAIT = 120  # longest backoff this code sleeps; a longer Retry-After stops the run
 
 def retry_after(e, default):
     v = ((getattr(e, "headers", None) or {}).get("Retry-After") or "").strip()
@@ -181,7 +188,10 @@ def fetch(url, retries=4):
                 return None
             if e.code not in RETRY or attempt == retries - 1:
                 raise
-            time.sleep(min(retry_after(e, 15 * (attempt + 1)), 120))
+            wait = retry_after(e, 15 * (attempt + 1))
+            if wait > MAX_WAIT:
+                raise RuntimeError(f"{url}: server asked to wait {wait:.0f} s (> {MAX_WAIT} s); stopping") from e
+            time.sleep(wait)
         except OSError:
             if attempt == retries - 1:
                 raise
@@ -197,8 +207,8 @@ def itunes(path, params):
 
 def lookup_ids(app_ids, country="us", chunk=100):
     """Return {trackId: raw_result}. Missing/removed IDs are simply absent; compare against the input."""
-    if chunk > 100:
-        raise ValueError("lookup silently drops IDs past about 210 per call; keep chunk <= 100")
+    if not isinstance(chunk, int) or isinstance(chunk, bool) or not 1 <= chunk <= 100:
+        raise ValueError("chunk must be an integer from 1 to 100 (lookup silently drops IDs past about 210 per call)")
     out = {}
     app_ids = [int(i) for i in app_ids]
     for i in range(0, len(app_ids), chunk):
@@ -262,7 +272,8 @@ de [('Streaks', 6.99, 'EUR', '6,99\xa0€')]
 import email.utils, json, re, sys, time, urllib.error, urllib.request
 
 UA = f"Python-urllib/{sys.version_info.major}.{sys.version_info.minor}"  # truthful client UA
-RETRY = {403, 429, 500, 502, 503, 504}
+RETRY = {429, 500, 502, 503, 504}  # 403 and other statuses are not retried
+MAX_WAIT = 120  # longest backoff this code sleeps; a longer Retry-After stops the run
 
 def retry_after(e, default):
     v = ((getattr(e, "headers", None) or {}).get("Retry-After") or "").strip()
@@ -286,7 +297,10 @@ def fetch(url, retries=4):
                 return None
             if e.code not in RETRY or attempt == retries - 1:
                 raise
-            time.sleep(min(retry_after(e, 15 * (attempt + 1)), 120))
+            wait = retry_after(e, 15 * (attempt + 1))
+            if wait > MAX_WAIT:
+                raise RuntimeError(f"{url}: server asked to wait {wait:.0f} s (> {MAX_WAIT} s); stopping") from e
+            time.sleep(wait)
         except OSError:
             if attempt == retries - 1:
                 raise
@@ -362,10 +376,10 @@ Output:
 
 ### 4. Same extras from inside a browser tab
 
-Use this when you are already driving a tab. The rendered DOM no longer contains `#serialized-server-data` (the SPA removes it after hydration; `document.getElementById` returned null on all 3 test pages), so the snippet re-fetches the requested app URL in-page and parses it. The fetch is started in the page and polled, so no single `js()` call waits on a 1 MB download. `open_app` waits until the tab's own URL shows the requested app ID before anything is read, so a previous page's ready state is never used. It runs in the background tab; it never calls `activate_tab`.
+Use this when you are already driving a tab. The rendered DOM no longer contains `#serialized-server-data` (the SPA removes it after hydration; `document.getElementById` returned null on all 3 test pages), so the snippet re-fetches the requested app URL in-page and parses it. The fetch is started in the page and polled, so no single `js()` call waits on a 1 MB download. `open_app` waits until the tab's own URL shows the requested app ID (as a whole number, so `/id3106` does not match `/id310633997`) before anything is read, so a previous page's ready state is never used. It runs in the background tab; it never calls `activate_tab`.
 
 ```python
-import json, time
+import json, re, time
 
 def browser_timeout(e):
     # cdp/IPC timeouts raise TimeoutError; js() wraps a timed-out Runtime.evaluate in RuntimeError("... timed out ...")
@@ -379,7 +393,7 @@ def open_app(app_id, first_tab, timeout=30):
     while time.time() < deadline:
         try:
             state = js("[location.href, document.readyState]")
-            if state and f"/id{app_id}" in state[0] and state[1] == "complete":
+            if state and re.search(rf"/id{app_id}(?!\d)", state[0]) and state[1] == "complete":
                 return state[0]
         except Exception as e:
             if not browser_timeout(e):
@@ -410,7 +424,8 @@ EXTRACT = r"""(async (url, appId) => {
 })"""
 
 def extract_in_tab(app_id, retries=3, timeout=45):
-    """Page extras for app_id via an in-page fetch. None on HTTP 404; retries 429/5xx and browser timeouts, then raises."""
+    """Page extras for app_id via an in-page fetch. None on HTTP 404; retries 429/5xx and browser timeouts
+    with backoff (no sleep after the last try), then raises. 403 and other statuses raise at once."""
     url, out = f"https://apps.apple.com/us/app/id{app_id}", None
     for attempt in range(retries):
         js(f"window.__bhApp = null; ({EXTRACT})({json.dumps(url)}, {json.dumps(str(app_id))})"
@@ -428,9 +443,10 @@ def extract_in_tab(app_id, retries=3, timeout=45):
             return out
         if status == 404:
             return None
-        if out is not None and status not in (403, 429, 500, 502, 503, 504) and "status" in out:
+        if out is not None and status not in (429, 500, 502, 503, 504) and "status" in out:
             raise RuntimeError(f"app {app_id}: {out}")  # e.g. wrong app or missing embedded data
-        time.sleep(15 * (attempt + 1))  # 429/5xx, fetch error or poll timeout: back off and retry
+        if attempt < retries - 1:
+            time.sleep(15 * (attempt + 1))  # 429/5xx, fetch error or poll timeout: back off and retry
     raise RuntimeError(f"app {app_id}: in-page fetch still failing after {retries} tries: {out}")
 
 for n, app_id in enumerate([310633997, 1586435171]):  # WhatsApp, Actions
@@ -493,7 +509,7 @@ The `information` items also carry `Seller`, `Compatibility`, `Languages`, `Age 
 
 - **`offset` does not paginate search.** For "habit tracker", `limit=50&offset=50` returned 48 apps, of which 45 (one run) and 48 (another run) were already on the `limit=50` page. Ordering also shifts between runs and between `limit` values (in one run `limit=50` was a prefix of `limit=200`, in another it was not). Always ask for `limit=200` once per term.
 - `limit` caps at 200 (`limit=500` returned 171 for "photo editor"). Typical full queries returned 171 to 193 apps. Without `limit` you get far fewer (38 to 39 for "photo editor" across runs).
-- **Lookup silently truncates around 210 IDs.** 250 IDs returned 209-210 results with no error. 100, 150 and 200 IDs returned every ID, or all but one in another run (an app that was no longer available drops out the same way the bad ID `1` does). Chunk at 100; block 2 refuses larger chunks.
+- **Lookup silently truncates around 210 IDs.** 250 IDs returned 209-210 results with no error. 100, 150 and 200 IDs returned every ID, or all but one in another run (an app that was no longer available drops out the same way the bad ID `1` does). Chunk at 100; block 2 refuses chunks outside 1 to 100.
 - Unknown IDs return HTTP 200 with `{"resultCount": 0, "results": []}` on the API and HTTP 404 on the app page. Blocks 3 and 4 return `None` for that 404; every other failure raises.
 - `country` changes currency and price (Streaks: $5.99 US, £5.99 GB, 6,99 € DE) and the result language. Results differ per storefront.
 - Developer lookup returns an `artist` record first; filter `wrapperType == "software"`.
@@ -503,7 +519,7 @@ The `information` items also carry `Seller`, `Compatibility`, `Languages`, `Age 
 - Only the 25 most recent versions are embedded (all 5 apps tested had exactly 25). Older versions are not on the page, so 25 means "maybe more", not "all".
 - `https://apps.apple.com/us/app/id<ID>` works without the slug and redirects to the slugged URL. Match the tab URL on `/id<ID>`, not on the exact URL you navigated to.
 - No consent banner or login wall appeared on US app pages.
-- User-Agent: `Python-urllib/3.x` (and no UA header at all) got HTTP 200 from itunes.apple.com and apps.apple.com today.
+- Plain HTTP with the truthful `Python-urllib/3.x` User-Agent got HTTP 200 from itunes.apple.com and apps.apple.com today.
 
 ## What does not work
 
