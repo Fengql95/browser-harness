@@ -101,7 +101,8 @@ def offer_fields(o):
             text(g(o, 2)) or ("Free" if micros == 0 else None))
 
 def ld_app(html, app_id):
-    """The JSON-LD SoftwareApplication block for this package, or {} (never another app's block)."""
+    """The JSON-LD SoftwareApplication block whose url carries id=<app_id>, or {}.
+    A block with no url (or a url without id) is never assumed to be this app."""
     for m in re.finditer(r'<script type="application/ld\+json"[^>]*>(.*?)</script>', html, re.S):
         try:
             d = json.loads(m.group(1))
@@ -111,7 +112,7 @@ def ld_app(html, app_id):
             if not isinstance(item, dict) or "applicationCategory" not in item:
                 continue
             ids = urllib.parse.parse_qs(urllib.parse.urlparse(text(item.get("url")) or "").query).get("id")
-            if ids in (None, [app_id]):
+            if ids == [app_id]:
                 return item
     return {}
 
@@ -121,7 +122,8 @@ def ld_author(ld):
     return text(a.get("name")) if isinstance(a, dict) else text(a)
 
 def play_app(app_id):
-    """Full detail record for one package name, or None if the app is not in this store (HTTP 404)."""
+    """Full detail record for one package name, or None if Play returns HTTP 404
+    or the page has neither app data nor JSON-LD for this id."""
     url = "https://play.google.com/store/apps/details?" + urllib.parse.urlencode({"id": app_id, "hl": HL, "gl": GL})
     try:
         html = fetch(url)
@@ -169,7 +171,7 @@ def play_app(app_id):
 # --- 1) full records for a few package names, including one that does not exist ---
 for app_id in ["com.spotify.music", "com.mojang.minecraftpe", "org.videolan.vlc", "com.example.does.not.exist"]:
     rec = play_app(app_id)
-    print(json.dumps(rec) if rec else f"{app_id}: not found (404)")
+    print(json.dumps(rec) if rec else f"{app_id}: no record (HTTP 404, or no data for this id on the page)")
     time.sleep(1)
 
 # --- 2) a batch of package names (for example from a developer page, block 3), one request per second ---
@@ -195,7 +197,7 @@ Output (from the run on 2026-10-23):
 {"app_id": "com.spotify.music", "title": "Spotify: Music and Podcasts", "developer": "Spotify AB", "developer_id": "6523013212965523194", "rating": 4.3489933, "ratings_count": 36528069, "installs": "1,000,000,000+", "min_installs": 1000000000, "installs_exact": 3171683950, "price": 0.0, "currency": "USD", "price_text": "Free", "category": "Music & Audio", "category_id": "MUSIC_AND_AUDIO", "updated": "Oct 23, 2026", "updated_ts": 1792759042, "version": "Varies with device", "content_rating": "Teen", "released": "May 27, 2014", "contains_ads": true, "in_app_purchases": "$4.99 - $203.88 per item", "url": "https://play.google.com/store/apps/details?id=com.spotify.music&hl=en_US&gl=US"}
 {"app_id": "com.mojang.minecraftpe", "title": "Minecraft: Dream it, Build it!", "developer": "Mojang", "developer_id": "4772240228547998649", "rating": 4.303256, "ratings_count": 5866778, "installs": "50,000,000+", "min_installs": 50000000, "installs_exact": 99618770, "price": 6.99, "currency": "USD", "price_text": "$6.99", "category": "Arcade", "category_id": "GAME_ARCADE", "updated": "Sep 25, 2026", "updated_ts": 1790357188, "version": "1.26.52.3", "content_rating": "Everyone 10+", "released": "Aug 15, 2011", "contains_ads": false, "in_app_purchases": "$0.99 - $49.99 per item", "url": "https://play.google.com/store/apps/details?id=com.mojang.minecraftpe&hl=en_US&gl=US"}
 {"app_id": "org.videolan.vlc", "title": "VLC for Android", "developer": "Videolabs", "developer_id": "6364851808230428105", "rating": 4.042392, "ratings_count": 2009187, "installs": "500,000,000+", "min_installs": 500000000, "installs_exact": 515866848, "price": 0.0, "currency": "USD", "price_text": "Free", "category": "Video Players & Editors", "category_id": "VIDEO_PLAYERS", "updated": "Oct 14, 2026", "updated_ts": 1791980045, "version": "Varies with device", "content_rating": "Everyone", "released": "Feb 4, 2015", "contains_ads": false, "in_app_purchases": null, "url": "https://play.google.com/store/apps/details?id=org.videolan.vlc&hl=en_US&gl=US"}
-com.example.does.not.exist: not found (404)
+com.example.does.not.exist: no record (HTTP 404, or no data for this id on the page)
 detailed: 10 of 10 missing: []
 com.whatsapp | WhatsApp | WhatsApp LLC | 4.624199 246257140 | 10,000,000,000+ | Free | Communication | Oct 19, 2026 | 2.26.41.77 | Everyone
 com.instagram.android | Instagram | Instagram | 3.9892468 169555719 | 5,000,000,000+ | Free | Social | Oct 21, 2026 | Varies with device | Teen
@@ -249,7 +251,7 @@ def browser_app(app_id):
         try {
           const d = JSON.parse(s.textContent);
           for (const it of (Array.isArray(d) ? d : [d])) {
-            const id = it && it.url ? new URL(it.url, location.href).searchParams.get('id') : want;
+            const id = it && typeof it.url === 'string' && it.url && !it.url.startsWith('#') ? new URL(it.url, location.origin).searchParams.get('id') : null;
             if (it && it.applicationCategory && id === want) { ld = it; break; }
           }
         } catch (e) {}
@@ -336,7 +338,7 @@ def developer_name(app_id):
         try {
           const d = JSON.parse(s.textContent);
           for (const it of (Array.isArray(d) ? d : [d])) {
-            const id = it && it.url ? new URL(it.url, location.href).searchParams.get('id') : %s;
+            const id = it && typeof it.url === 'string' && it.url && !it.url.startsWith('#') ? new URL(it.url, location.origin).searchParams.get('id') : null;
             if (it && it.applicationCategory && id === %s) {
               const a = Array.isArray(it.author) ? it.author[0] : it.author;
               return typeof a === 'string' ? a : (a && a.name) || null;
@@ -345,7 +347,7 @@ def developer_name(app_id):
         } catch (e) {}
       }
       return null;
-    })()""" % (json.dumps(app_id), json.dumps(app_id)))
+    })()""" % json.dumps(app_id))
 
 # one row per package name, in page order; card text is "title\ndeveloper\nrating\nstar"
 CARDS_JS = r"""(() => {
@@ -447,7 +449,7 @@ Developer list from `developer_apps()`: `app_id`, `title`, `developer`, `rating`
 ## Gotchas
 
 - **Positional arrays, not named keys.** The `AF_initDataCallback` data is nested lists. Indexes above were correct on 2026-10-23; when Play ships a new frontend they can move. The code uses a safe getter `g()` plus type checks (`num()`, `text()`) so a moved field becomes `None` instead of a crash or a wrong type; check for a sudden column of `None`s. `play_app()` falls back to JSON-LD for title, developer, rating, ratings count, price, currency, category id and content rating; installs, updated, version and the rest have no fallback.
-- **Callback keys are not stable labels.** The app data was in `ds:5` on the pages tested, but the code finds the callback by matching the package name at `a[77][0]` rather than trusting the key. JSON-LD is only used when its `url` carries the same `id`.
+- **Callback keys are not stable labels.** The app data was in `ds:5` on the pages tested, but the code finds the callback by matching the package name at `a[77][0]` rather than trusting the key. JSON-LD is only used when its `url` carries the same `id`; a block with no `url`, or a `url` with no `id`, is ignored by all three readers (`ld_app`, `browser_app`, `developer_name`). On the pages tested the `SoftwareApplication` block always had a `url` like `.../details/Spotify_Music_and_Podcasts?id=com.spotify.music&hl=en_US`.
 - **Developer pages render 20 apps, then load more on scroll from a disallowed path.** In the cloud browser, Google LLC showed 20 apps on load; one scroll to the bottom made the page call `/_/PlayStoreUi/data/batchexecute?rpcids=qnKhOb` and the list grew to 40. robots.txt disallows `/_`, so `developer_apps()` never scrolls and reports `maybe_more=True` for a full page of 20. Lists under 20 (Rovio Entertainment Oy 16, Mojang 3) are everything the page shows.
 - **The page makes its own background requests.** A normal page load also requested `/_/PlayStoreUi/browserinfo` and `/play/log` by itself; the skill does not call these and does nothing to trigger more of them.
 - **Developer page names must match exactly.** `Rovio Entertainment Corporation` gave a Not Found page; the name on the Angry Birds 2 page is `Rovio Entertainment Oy`. Take the name from the app page (`developer_name()`, or `developer` from `play_app()`), never from memory. `developer_apps()` returns `None` for Not Found, so "no such page" is distinct from an empty list (an empty list raises).
