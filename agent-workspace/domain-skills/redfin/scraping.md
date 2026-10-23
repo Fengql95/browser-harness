@@ -38,39 +38,55 @@ def search_path(s):
 
 BLOCKED = re.compile(r"request could not be satisfied|ratelimited|access denied|are you a human|captcha", re.I)
 CARDS = '[data-rf-test-name="basicNode-homeCard"]'
+ZERO = ".ZeroResultsText, .nearbyHomesTitle"   # "We didn't find any exact matches" / "Homes within 1 mile of ..."
+POLL_JS = ("JSON.stringify({old: !!window.__bhOld, u: location.href, t: document.title, r: document.readyState, "
+           "n: document.querySelectorAll('%s').length, z: !!document.querySelector('%s')})" % (CARDS.replace("'", "\\'"), ZERO))
 
-def open_page(url, tries=3, timeout=60):
-    """Load url in the tab and wait until result cards render. Returns the URL the tab landed on.
-    A block or challenge page raises at once (stop and back off). A page that never renders cards
-    is retried after 10 s and 20 s, then raises."""
-    for attempt in range(tries):
+def open_page(url, budget=120, per_try=30):
+    """Load url in the tab and wait for the new document. Returns the URL it landed on: url itself once result
+    cards (or Redfin's no-exact-matches view) have rendered, or the redirect target, which the caller must check.
+    A block or challenge page raises at once (stop and back off). A page that never renders is retried after
+    10 s, then 20 s, all inside one budget-second deadline; then it raises."""
+    end, pause, attempt = time.time() + budget, 10, 0
+    while True:
+        attempt += 1
+        before = js("window.__bhOld = 1, location.href")   # tag the old document; the new one will not carry the tag
         try:
             goto_url(url)
         except Exception as e:       # Page.navigate often outlives the 5 s daemon wait on these heavy pages
             print("navigate still running:", str(e)[:80])
-        deadline, n, last = time.time() + timeout, -1, None
-        while time.time() < deadline:
+        stop, n, z, last = min(end, time.time() + per_try), -1, False, None
+        while time.time() + 1 < stop:   # the last poll starts before the deadline
             time.sleep(1)
             try:
-                st = json.loads(js("JSON.stringify({u: location.href, t: document.title, r: document.readyState, "
-                                   "n: document.querySelectorAll('%s').length})" % CARDS.replace("'", "\\'")))
+                st = last = json.loads(js(POLL_JS))
             except Exception:
                 continue                 # page still busy; poll again
+            if st["old"]:
+                continue                 # still the document from before the navigation
             if BLOCKED.search(st["t"]) or "ratelimited" in st["u"]:
                 raise RuntimeError(f"Redfin served a block/challenge page ({st['t']!r} at {st['u']}). Stop and back off.")
-            if st["r"] == "complete" and st["n"] > 0 and st["n"] == n:
-                return st["u"]           # card count stable across two polls
-            n, last = st["n"], st
-        print(f"try {attempt + 1}/{tries}: no result cards at {url} (last state {last})")
-        if attempt + 1 < tries:
-            time.sleep(10 * 2 ** attempt)
-    raise RuntimeError(f"page never rendered result cards after {tries} tries: {url}")
+            if st["r"] != "complete":
+                continue
+            if st["u"].rstrip("/") != url.rstrip("/"):
+                return st["u"]           # a new document at another URL: redirected
+            if (st["n"] > 0 and st["n"] == n) or (st["z"] and z):
+                return st["u"]           # card count (or the zero-results view) stable across two polls
+            n, z = st["n"], st["z"]
+        print(f"try {attempt}: {url} not ready (navigated from {before}; last state {last})")
+        if time.time() + pause + 15 > end:
+            break                        # no time left for a backoff and another try; no sleep after the last one
+        time.sleep(pause)
+        pause *= 2
+    raise RuntimeError(f"{url} did not render within the {budget} s budget ({attempt} tries)")
 
 def header_total():
     """'323 homes + 9 early access' -> 332."""
     t = js("(document.querySelector('.homes.summary, [data-rf-test-id=\"homes-description\"]') || {}).innerText || ''")
     nums = [int(x.replace(",", "")) for x in re.findall(r"([\d,]+) (?:homes?|early access)", t)]
     if not nums:
+        if js("!!document.querySelector('%s')" % ZERO):
+            return 0, "no exact matches"
         raise RuntimeError(f"could not read the result count from the page header: {t!r}")
     return sum(nums), t
 
@@ -149,9 +165,11 @@ def from_card(c, pid):
 
 path = search_path(SEARCH)
 new_tab()
-open_page(BASE + path)
+landed = open_page(BASE + path)
+if landed.rstrip("/") != BASE + path:
+    raise RuntimeError(f"{BASE + path} redirected to {landed}; check SEARCH")
 total, header = header_total()
-emb = embedded_homes()
+emb = embedded_homes() if total else {}
 print(f"{path}: header says {header!r} -> {total}; embedded map data has {len(emb)} homes")
 
 rows = {}
@@ -178,8 +196,9 @@ else:                                     # page through the list (about 41 card
         if page > MAX_PAGES:
             raise RuntimeError(f"hit MAX_PAGES={MAX_PAGES}; {len(rows)} of {total} rows so far. Raise MAX_PAGES and rerun.")
         time.sleep(PAUSE)
-        landed = open_page(f"{BASE}{path}/page-{page}")
-        if not landed.rstrip("/").endswith(f"/page-{page}"):
+        want = f"{BASE}{path}/page-{page}"
+        landed = open_page(want)
+        if landed.rstrip("/") != want:
             print(f"page-{page} redirected to {landed}; treating it as the end of the list")
             break
     for pid, h in emb.items():            # embedded homes no card showed are still part of the result
@@ -189,16 +208,17 @@ rows = list(rows.values())
 short = total - len(rows)
 if short > max(2, total * MAX_SHORT):
     raise RuntimeError(f"collected {len(rows)} of the {total} homes the page header reports ({header!r}), {short} missing. "
-                       "Search ZIP by ZIP, or raise MAX_SHORT to accept the shortfall.")
+                       "Raise MAX_SHORT only if you accept an incomplete result.")
 
 out = os.path.join(tempfile.gettempdir(), "redfin_listings")
 with open(out + ".json", "w") as f:
     json.dump(rows, f)
 with open(out + ".csv", "w", newline="") as f:
-    w = csv.DictWriter(f, fieldnames=list(rows[0]))
+    w = csv.DictWriter(f, fieldnames=list(from_embedded({})))   # same columns even when rows is empty
     w.writeheader()
     w.writerows(rows)
-print("saved", len(rows), "rows to", out + ".json", "and .csv;", sum(r["source"] == "card" for r in rows), "from cards only")
+print("saved", len(rows), "rows to", out + ".json", "and .csv;", sum(r["source"] == "card" for r in rows), "from cards only;",
+      f"header count {total}, {max(short, 0)} short")
 print(json.dumps(rows[:2], indent=1))
 ```
 
@@ -206,7 +226,7 @@ Observed output (trimmed):
 
 ```text
 /zipcode/78704: header says '323 homes + 9 early access' -> 332; embedded map data has 332 homes
-saved 332 rows to /tmp/.../redfin_listings.json and .csv; 0 from cards only
+saved 332 rows to /tmp/.../redfin_listings.json and .csv; 0 from cards only; header count 332, 0 short
 [
  {"property_id": 31703545, "listing_id": 224677425, "mls_id": "3820245",
   "address": "503 S Park Dr", "city": "Austin", "state": "TX", "zip": "78704",
@@ -238,7 +258,7 @@ page 150: 41 cards, 0 new, 5796 unique so far
 saved 5796 rows to /tmp/.../redfin_listings.json and .csv; 5446 from cards only
 ```
 
-That crawl took 14 min 39 s. The 112 missing homes are close to the 120 early-access homes in the header count, so the paged list may leave most early-access homes out past the first 350; that was not checked home by home. With the default `MAX_SHORT = 0.01` the same numbers raise instead of saving (112 > 59), and an earlier full Austin crawl the same afternoon (5,795 of 5,903) did raise. For complete coverage of a big city, search it ZIP by ZIP. Across the 5,446 Austin card rows: price null 14, beds 431, baths 402, sqft 412; 390 were land cards whose lot size went to `lot_sqft`.
+That crawl took 14 min 39 s and ran an earlier version of block 1, whose save line did not yet print the header count and shortfall. The 78745 paging run was repeated with the current block: same 10 pages and 369 rows, ending `header count 365, 0 short`. The 112 missing homes are close to the 120 early-access homes in the header count, so the paged list may leave most early-access homes out past the first 350; that was not checked home by home. With the default `MAX_SHORT = 0.01` the same numbers raise instead of saving (112 > 59), and an earlier full Austin crawl the same afternoon (5,795 of 5,903) did raise. The paged list is the whole crawl this skill makes, so a big city's result can stay short of the header count; block 1 raises rather than report it as complete. Across the 5,446 Austin card rows: price null 14, beds 431, baths 402, sqft 412; 390 were land cards whose lot size went to `lot_sqft`.
 
 ### 2. Key facts from a listing detail page (browser)
 
@@ -258,31 +278,39 @@ BLOCKED = re.compile(r"request could not be satisfied|ratelimited|access denied|
 READY_JS = ("[...document.querySelectorAll('script[type=\"application/ld+json\"]')].some(s => s.textContent.includes('RealEstateListing'))"
             " && [...document.scripts].some(s => !s.src && s.textContent.includes('__reactServerState.InitialContext = '))")
 
-def open_listing(url, tries=3, timeout=60):
-    """Load a listing page and wait for its JSON-LD and embedded data. Returns the URL the tab landed on
-    (a gone listing redirects away from /home/). A block or challenge page raises at once (stop and back off).
-    A page that never finishes is retried after 10 s and 20 s, then raises."""
-    for attempt in range(tries):
+def open_listing(url, budget=120, per_try=30):
+    """Load a listing page and wait for the new document. Returns the URL it landed on: url itself once its JSON-LD
+    and embedded data are there, or the redirect target (a gone listing redirects away). A block or challenge page
+    raises at once (stop and back off). A page that never finishes is retried after 10 s, then 20 s, all inside
+    one budget-second deadline; then it raises."""
+    end, pause, attempt = time.time() + budget, 10, 0
+    while True:
+        attempt += 1
+        before = js("window.__bhOld = 1, location.href")   # tag the old document; the new one will not carry the tag
         try:
             goto_url(url)
         except Exception as e:       # Page.navigate often outlives the 5 s daemon wait on these heavy pages
             print("navigate still running:", str(e)[:80])
-        deadline, last = time.time() + timeout, None
-        while time.time() < deadline:
+        stop, last = min(end, time.time() + per_try), None
+        while time.time() + 1 < stop:   # the last poll starts before the deadline
             time.sleep(1)
             try:
-                st = json.loads(js("JSON.stringify({u: location.href, t: document.title, r: document.readyState, ok: %s})" % READY_JS))
+                st = last = json.loads(js("JSON.stringify({old: !!window.__bhOld, u: location.href, t: document.title, "
+                                          "r: document.readyState, ok: %s})" % READY_JS))
             except Exception:
                 continue                 # page still busy; poll again
+            if st["old"]:
+                continue                 # still the document from before the navigation
             if BLOCKED.search(st["t"]) or "ratelimited" in st["u"]:
                 raise RuntimeError(f"Redfin served a block/challenge page ({st['t']!r} at {st['u']}). Stop and back off.")
-            if st["r"] == "complete" and (st["ok"] or "/home/" not in st["u"]):
-                return st["u"]
-            last = st
-        print(f"try {attempt + 1}/{tries}: listing page not ready at {url} (last state {last})")
-        if attempt + 1 < tries:
-            time.sleep(10 * 2 ** attempt)
-    raise RuntimeError(f"listing page never finished loading after {tries} tries: {url}")
+            if st["r"] == "complete" and (st["ok"] or st["u"].rstrip("/") != url.rstrip("/")):
+                return st["u"]           # ready, or a new document at another URL (redirected)
+        print(f"try {attempt}: {url} not ready (navigated from {before}; last state {last})")
+        if time.time() + pause + 15 > end:
+            break                        # no time left for a backoff and another try; no sleep after the last one
+        time.sleep(pause)
+        pause *= 2
+    raise RuntimeError(f"{url} did not finish loading within the {budget} s budget ({attempt} tries)")
 
 # The listing page HTML embeds the server-rendered detail data in __reactServerState.
 STATE_JS = r"""(() => {
@@ -308,8 +336,9 @@ def strip_tags(s):
 
 def listing_details(url):
     landed = open_listing(url)
-    if "/home/" not in landed:
-        return None                      # listing gone or redirected to a search page
+    if landed.rstrip("/") != url.rstrip("/"):
+        print(f"{url} redirected to {landed}")
+        return None                      # listing gone or moved: never read another page's facts
     # 1) JSON-LD block typed ["Product", "RealEstateListing"]
     ld = None
     for t in js("[...document.querySelectorAll('script[type=\"application/ld+json\"]')].map(s => s.textContent)") or []:
@@ -444,7 +473,8 @@ Detail page:
 - The end of the list is not one fixed signal. In one probe Austin page-144 and page-146 redirected to `/city/30818/TX/Austin`; in the full crawls the list ran to page 149 and page 150 showed 41 cards that were all repeats. Block 1 stops on a redirect, on a page with no new homes, or once it has the header's count.
 - The site counts nearby homes: ZIP 78704's embedded data held 3 homes with ZIP 78745, and the header total (323 + 9 = 332) included them. ZIP 78745 gave 369 unique rows against a header of 365. City results follow Redfin's boundary, not the mailing city (Austin's first 350 included Pflugerville, Manchaca, Del Valle, Manor and Cedar Park addresses).
 - The header count moves while you crawl (Austin's header read 5,789 on one load and 5,786 on a later one the same afternoon), so block 1 allows a shortfall of `MAX_SHORT` (1%) and raises beyond that.
-- `goto_url()` on these pages often raised `Page.navigate timed out after 5s waiting for the daemon` while the page went on loading. The open helpers swallow that and poll the page instead, so a slow load is not mistaken for a failure.
+- `goto_url()` on these pages often raised `Page.navigate timed out after 5s waiting for the daemon` while the page went on loading. The open helpers swallow that and poll the page instead, so a slow load is not mistaken for a failure. If the navigation never starts, the old page stays up and looks ready (tested by replacing `goto_url` with a call that only raises: `open_page` read nothing and raised after 120 s), so each helper first tags the current document (`window.__bhOld`) and records its URL, then reads nothing until a new document without the tag is there, and compares its `location.href` with the requested URL: a different URL is returned as a redirect, never read as the requested page. Both checks matter here: a listing page matches the card selector too (31 cards on one), and `/TX/Austin/503-S-Park-Dr-78704/home/1` redirected to a different listing in Seattle, for which block 2 returns `None`. Retries share one 120 s deadline (two backoffs, 10 s and 20 s, and no sleep after the last try).
+- A ZIP with no homes for sale has no header count. ZIP 20500 showed "We didn't find any exact matches" (`.ZeroResultsText`, 0 cards, empty embedded `homes`); ZIP 10020 showed 20 nearby homes under "Homes within 1 mile of 10020, NY" (`.nearbyHomesTitle`) and no `homes` key in the embedded data. Block 1 treats both as 0 homes and saves an empty JSON list and a header-only CSV.
 - There is no ZIP or city id lookup in this skill. ZIPs need no id (`/zipcode/78704`). City ids come from the address bar after searching on redfin.com by hand, or from the "Popular Cities" links on `/state/<State>` (16 cities on `/state/Texas`, including `/city/30818/TX/Austin`).
 - A card's JSON-LD is usually a list (`SingleFamilyResidence` or `Accommodation`, plus a `Product` with `offers.price`), but 3 of the 41 cards on Austin page 35 carried a single object with no `Product`. Block 1 accepts both and then takes the price from the card text.
 - Land cards put `Land` where beds go and the lot size where sqft goes (`0.38 acre (lot)`, `9,557 sq ft (lot)`); 7 of the 22 cards on Austin page 18 were land. Block 1 moves that number to `lot_sqft`.

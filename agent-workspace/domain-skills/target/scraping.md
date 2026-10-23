@@ -32,15 +32,27 @@ def blocked(status):
     return (f"Target answered the category page's own listing request with HTTP {status} "
             "(PerimeterX returns 435). Stop and back off; do not retry or try to solve the captcha.")
 
-def body(request_id):
-    r = cdp("Network.getResponseBody", requestId=request_id)
+def body(session, request_id):
+    r = cdp("Network.getResponseBody", session_id=session, requestId=request_id)
     return json.loads(base64.b64decode(r["body"]) if r.get("base64Encoded") else r["body"])
 
-def read_page(timeout=30):
+def navigate(url, timeout=15):
+    """Load url in the attached tab and confirm the tab is really there before reading."""
+    before = js("location.href")
+    goto_url(url)
+    deadline = time.time() + timeout
+    while (href := js("location.href")) != url:
+        if time.time() > deadline:
+            raise RuntimeError(f"asked for {url} (tab was on {before}), tab is on {href}")
+        time.sleep(0.2)
+
+def read_page(session, timeout=30):
     """Read the JSON the page itself fetched while loading (no extra requests)."""
     reqs, listing, ful, start = {}, None, {}, time.time()
     while time.time() < start + timeout:
         for e in drain_events():
+            if e.get("session_id") != session:   # events from other attached tabs
+                continue
             m, p = e.get("method"), e.get("params") or {}
             if m == "Network.requestWillBeSent":
                 url = p["request"]["url"]
@@ -58,7 +70,7 @@ def read_page(timeout=30):
                 if r.get("status") != 200:
                     raise SystemExit(blocked(r.get("status")) if r["kind"] == "listing"
                                      else f"fulfillment request HTTP {r.get('status')}")
-                data = body(p["requestId"])["data"]
+                data = body(session, p["requestId"])["data"]
                 if r["kind"] == "listing":
                     listing = data["search"]
                 else:
@@ -97,16 +109,20 @@ def parse(p, f):
         "sponsored": bool(p.get("is_sponsored_sku")),
     }
 
-drain_events()
-tab = new_tab(CATEGORY_URL)   # reuses the current tab if it is blank
+try:
+    cur = current_tab()
+except Exception:
+    cur = {}
+tab = cur.get("targetId") if cur.get("url") in ("", "about:blank") else new_tab()   # reuse a blank tab
+session = switch_tab(tab)     # its CDP session id; read_page ignores events from any other tab
 rows, seen, meta = [], set(), {}
 try:
     for page in range(MAX_PAGES):
         if page:
             time.sleep(3)   # polite pacing between page loads
-            drain_events()
-            goto_url(f"{CATEGORY_URL}?Nao={page * 24}")   # the page's own pagination URL
-        listing, ful = read_page()
+        drain_events()
+        navigate(f"{CATEGORY_URL}?Nao={page * 24}" if page else CATEGORY_URL)   # the page's own pagination URL
+        listing, ful = read_page(session)
         meta = (listing.get("search_response") or {}).get("metadata") or {}
         if meta.get("offset") != page * 24:
             raise RuntimeError(f"asked for offset {page * 24}, page returned {meta.get('offset')}")
@@ -241,7 +257,17 @@ import json, time
 TCIN = "89110863".strip().removeprefix("A-")
 ALLOW_FOREGROUND = False   # opt-in: True lets this block bring the tab to the front (visible tab switch)
 
-tab = new_tab(f"https://www.target.com/p/-/A-{TCIN}")
+URL = f"https://www.target.com/p/-/A-{TCIN}"
+
+tab = new_tab()
+before = js("location.href")
+goto_url(URL)
+deadline = time.time() + 15
+while (href := js("location.href")) != URL:   # confirm the tab really is on the requested page before reading it
+    if time.time() > deadline:
+        close_tab(tab)
+        raise SystemExit(f"asked for {URL} (tab was on {before}), tab is on {href}")
+    time.sleep(0.2)
 wait_for_load()
 
 # Price and fulfillment are deferred modules, filled after load by
@@ -315,15 +341,15 @@ Product page (`ProductDetailWebDatasourceCore.module_data.data.product`, block 2
 
 ## Gotchas
 
-- **No extra requests.** Block 1 never calls redsky itself (its robots.txt disallows everything). It reads the two responses the category page fetched while loading, via the `Network.*` events the harness daemon records and `cdp("Network.getResponseBody", requestId=...)`. The daemon keeps only the last 500 events, so the block drains them before each navigation and polls every 0.2 s while the page loads.
+- **No extra requests.** Block 1 never calls redsky itself (its robots.txt disallows everything). It reads the two responses the category page fetched while loading, via the `Network.*` events the harness daemon records and `cdp("Network.getResponseBody", requestId=...)`. The daemon keeps only the last 500 events, so the block drains them before each navigation and polls every 0.2 s while the page loads. The event buffer is shared by every attached tab, so `read_page` keeps only events whose `session_id` is the block's own tab session (from `switch_tab`) and fetches bodies on that session. `navigate` records the tab's URL, loads the new one and waits until `location.href` equals it before any reading; block 3 does the same.
 - **Pagination is a page load.** Clicking the pager's "next page" button changed the URL to `?Nao=24&moveTo=product-list-grid` and the page sent `plp_search_v2` with `offset=24`. Block 1 loads `?Nao=<offset>` directly and checks `metadata.offset` matches.
 - **Use a subcategory, not a department landing page.** `/c/electronics/-/N-5xtg6` sent `plp_search_v2` (30 products) but rendered promos and carousels with no product grid or pager, and fulfillment arrived for only 9 of the 30 TCINs within 30 s. Block 1 stops with an error there. Leaf and mid-level categories (Air Fryers, Fryers) have the grid and the "page 1 of N" pager and worked.
 - **Hidden tabs.** Block 1 also worked in a background tab (`visibilityState` `hidden`) for Air Fryers, so it does not need to bring the tab to the front.
 - **Sponsored slots.** The first pages hold 30 products for `count=24`; the 6 extras are sponsored (`is_sponsored_sku: true`), and some repeat an organic TCIN on the same page. The block drops sponsored rows and dedupes by TCIN, and stops at `total_pages` or an empty page.
 - **Results depend on location.** The store, pickup status and some prices come from the store Target picks for the browser's IP (`store_ids`, `zip` in the listing URL). In one cloud session the store was in New York and 266 of 270 air fryer rows were pickup `UNAVAILABLE`; another session got `IN_STOCK` for the first row.
-- **A fresh browser can be blocked on its very first page load.** In 1 of 3 fresh cloud browser sessions on 2026-10-23 the category page's own `plp_search_v2` request got HTTP 435 (PerimeterX) on the first load, with no earlier requests, and block 1 stopped with its block message. Back off; do not retry in that session or try to solve the captcha. A session started about 5 minutes later ran all blocks without a block.
+- **A fresh browser can be blocked on its very first page load.** In 2 of 6 fresh cloud browser sessions on 2026-10-23 the category page's own `plp_search_v2` request got HTTP 435 (PerimeterX) on the first load, with no earlier requests, and block 1 stopped with its block message. Back off; do not retry in that session or try to solve the captcha. Both times a new session started 5 to 6 minutes later ran all blocks without a block.
 - **Pacing.** Block 1 waits 3 s between page loads. In unblocked sessions on 2026-10-23, about 30 category page loads (including one 12-page walk) produced no 429 and no new block; heavier rates were not tested.
-- **Tabs.** Block 1 opens the category in the current tab if it is blank (otherwise a new tab) and closes it in `finally`; block 3 opens and closes its own tab. Closing the last tab left the cloud browser with 0 tabs, and the next `new_tab()` still worked. Once, with three tabs open, `goto_url` for page 2 raised `Page.navigate timed out after 5s`; it did not recur with one tab.
+- **Tabs.** Block 1 uses the current tab if it is blank (otherwise a new tab) and closes it in `finally`; block 3 opens and closes its own tab. When block 1 left an extra blank tab open, block 3's new background tab stayed `hidden` and stopped with its `ALLOW_FOREGROUND` message. Closing the last tab left the cloud browser with 0 tabs, and the next `new_tab()` still worked. Once, with three tabs open, `goto_url` for page 2 raised `Page.navigate timed out after 5s`; it did not recur with one tab.
 - **Hidden tabs do not render the PDP price.** In a background tab the price module stayed a placeholder (`data-test="price-module-placeholder"`) and `visibilityState` was `hidden`; `activate_tab(current_tab())` fixed it. Block 3 does that only with `ALLOW_FOREGROUND = True` because it visibly switches tabs; otherwise it stops with a message. In a cloud browser with only this tab open, the new tab was already `visible` and rendered the price without it.
 - **DOM selectors (fallback).** Category cards were `[data-test="@web/site-top-of-funnel/ProductCardWrapper"]` (30 on Air Fryers page 1 on desktop) and the pager `[data-test="listing-page-pagination"]` read `page 1 of 12`. Prefer the JSON.
 - No cookie/consent banner blocked anything on www.target.com from a US exit IP.

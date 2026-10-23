@@ -24,8 +24,8 @@ Title, SKU, price, sale price, rating, review count, availability and URL for re
 # the tab to the front. Left False, a hidden tab raises instead of taking over your window.
 FOREGROUND_TAB = False
 
-import json, time
-from urllib.parse import quote_plus
+import json, math, time
+from urllib.parse import quote_plus, urlparse, parse_qs
 
 EXTRACT_CARDS = r"""(() => {
   const money = s => { const m = (s || '').match(/\$([\d,]+\.\d{2})/); return m ? parseFloat(m[1].replace(/,/g, '')) : null; };
@@ -62,24 +62,44 @@ EXTRACT_CARDS = r"""(() => {
   });
 })()"""
 
-def safe_js(expr, tries=6):
+def safe_js(expr, tries=6, deadline=None):
     # The page's main thread is busy for a few seconds after navigation and
-    # Runtime.evaluate can time out; retry instead of failing.
+    # Runtime.evaluate can time out; retry instead of failing, but not past the deadline.
     for _ in range(tries):
         try:
             return js(expr)
         except (RuntimeError, TimeoutError):
+            if deadline is not None and time.monotonic() + 2 > deadline:
+                break
             wait(2)
     return None
 
-def nav(url):
+class NotReady(RuntimeError):
+    """The page did not render, or showed an error, in this attempt."""
+
+def nav(url, href_ok, timeout):
     # Best Buy keeps the main thread busy; give Page.navigate more than the 5 s default.
     # A tab can hang mid-navigation: stop it and navigate once more (a second timeout raises).
+    end = time.monotonic() + timeout
+    left = lambda: max(1, min(30, end - time.monotonic()))  # no CDP wait runs past the caller's deadline
+    # Record where the tab was and mark that document, so a reload of the same URL is told apart.
+    before = safe_js("(window.__bhOldDoc = true, location.href)", tries=1)
     try:
-        cdp("Page.navigate", url=url, _response_timeout=30)
+        cdp("Page.navigate", url=url, _response_timeout=left())
     except TimeoutError:
-        cdp("Page.stopLoading", _response_timeout=30)
-        cdp("Page.navigate", url=url, _response_timeout=30)
+        cdp("Page.stopLoading", _response_timeout=left())
+        cdp("Page.navigate", url=url, _response_timeout=left())
+    here = None
+    while time.monotonic() < end:  # read nothing until the tab is on a new document at the requested URL
+        wait(1)
+        here = safe_js("({href: location.href, old: !!window.__bhOldDoc,"
+                       " status: (performance.getEntriesByType('navigation')[0] || {}).responseStatus})", tries=1) or here
+        if here and not here["old"] and href_ok(here["href"]):
+            if here["status"] in (403, 429):  # a block: stop, never retry
+                raise RuntimeError(f"HTTP {here['status']} at {here['href']}: blocked, stop and back off")
+            return here["href"]
+    raise NotReady(f"navigation to {url} not confirmed within {timeout:.0f} s "
+                   f"(was {before}, now {here['href'] if here else 'unreadable'})")
 
 def ensure_visible():
     if safe_js("document.visibilityState") == "visible":
@@ -99,41 +119,84 @@ def search_url(query, page):
     url = f"https://www.bestbuy.com/site/searchpage.jsp?st={quote_plus(query)}"
     return url if page == 1 else f"{url}&cp={page}"
 
-def load_search_page(query, page=1):
-    nav(search_url(query, page))
+def search_href_ok(query, page):
+    def ok(href):  # Best Buy may add id=pcat17071 and reorder the parameters; st and cp must match
+        u = urlparse(href)
+        q = parse_qs(u.query)
+        return (u.netloc == "www.bestbuy.com" and u.path == "/site/searchpage.jsp"
+                and q.get("st") == [query] and q.get("cp", ["1"]) == [str(page)])
+    return ok
+
+def load_search_page(query, page, deadline):
+    def check_time(step):
+        if time.monotonic() > deadline:
+            raise NotReady(f"out of time while {step}")
+    nav(search_url(query, page), search_href_ok(query, page), timeout=min(45, deadline - time.monotonic()))
     for _ in range(20):  # wait until product titles have rendered
         wait(1.5)
-        if (safe_js("document.querySelectorAll('.product-list-item h3').length") or 0) > 0:
+        if (safe_js("document.querySelectorAll('.product-list-item h3').length", deadline=deadline) or 0) > 0:
             break
-        if safe_js("document.body.innerText.includes('unable to display products')"):
-            return [], None, page  # past the last page (or a transient error page)
+        # The block never asks for a page past the end (see PAGE_SIZE), so this is an error page.
+        if safe_js("document.body.innerText.includes('unable to display products')", deadline=deadline):
+            raise NotReady("Best Buy showed \"unable to display products\"")
+        check_time("waiting for product titles")
+    else:
+        raise NotReady("no product titles rendered in 30 s")
     # Cards and price blocks render lazily when they scroll into view.
     for _ in range(25):
-        safe_js("window.scrollBy(0, 800)")
+        check_time("scrolling")
+        safe_js("window.scrollBy(0, 800)", deadline=deadline)
         wait(0.6)
-        if safe_js("window.innerHeight + window.scrollY >= document.body.scrollHeight - 50"):
+        if safe_js("window.innerHeight + window.scrollY >= document.body.scrollHeight - 50", deadline=deadline):
             break
     for _ in range(3):  # revisit cards whose title or price block has not rendered yet
         missing = safe_js("""[...document.querySelectorAll('.product-list-item[data-product-id]')]
             .filter(c => !c.querySelector('h3') || !c.querySelector('[data-testid="price-block-customer-price"]'))
-            .map(c => c.getAttribute('data-product-id'))""") or []
+            .map(c => c.getAttribute('data-product-id'))""", deadline=deadline) or []
         if not missing:
             break
         for sku in missing:
-            safe_js(f"document.querySelector('.product-list-item[data-product-id=\"{sku}\"]')?.scrollIntoView({{block: 'center'}})")
+            check_time("revisiting unrendered cards")
+            safe_js(f"document.querySelector('.product-list-item[data-product-id=\"{sku}\"]')?.scrollIntoView({{block: 'center'}})", deadline=deadline)
             wait(0.8)
         wait(1.5)
-    cards = safe_js(EXTRACT_CARDS) or []
+    cards = safe_js(EXTRACT_CARDS, deadline=deadline)
+    if not cards:
+        raise NotReady("no product cards could be read")
     # listResult.count is sometimes {} and searchResultsNum is "" or a numeric string: accept numbers only
     meta = safe_js("""(() => {
       const num = v => (v === '' || v === null || v === undefined || typeof v === 'object') ? null
         : (Number.isFinite(Number(v)) ? Number(v) : null);
       const lr = (window._BBY_DATA_ || {}).listResult || {}, d = window.dioPageData || {};
       return {total: num(lr.count) ?? num(d.searchResultsNum), page: num(d.listPageNum) ?? num(lr.pageNumber)};
-    })()""") or {}
-    if meta.get("page") is not None and meta["page"] != page:  # confirms the cp-less URL is page 1
+    })()""", deadline=deadline) or {}
+    if meta.get("page") is None or meta.get("total") is None:
+        raise NotReady(f"Best Buy did not report the page number and result count ({meta})")
+    if meta["page"] != page:  # also confirms the cp-less URL is page 1
         raise RuntimeError(f"asked for page {page}, Best Buy rendered page {meta['page']}")
-    return cards, meta.get("total"), meta.get("page")
+    return cards, meta["total"], meta["page"]
+
+RETRY_BUDGET_S = 120  # one deadline per result page, covering every attempt and every backoff
+MIN_ATTEMPT_S = 40    # do not back off and retry unless an attempt this long still fits
+
+def fetch_page(query, page):
+    deadline = time.monotonic() + RETRY_BUDGET_S
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            return load_search_page(query, page, deadline)
+        except NotReady as e:
+            backoff = 15 * attempt
+            if time.monotonic() + backoff + MIN_ATTEMPT_S > deadline:  # last attempt: raise now, no sleep
+                raise RuntimeError(f"page {page} failed after {attempt} attempt(s) within {RETRY_BUDGET_S} s: {e}. "
+                                   "Results so far are incomplete; do not report them as the full crawl") from None
+            print(f"page {page}: {e}; backing off {backoff} s, then retrying")
+            time.sleep(backoff)
+
+# Best Buy paginates 18 organic results per page (24 cards = 18 organic + 6 sponsored; 1236 results
+# gave a last-page link of 69 = ceil(1236 / 18)). The crawl stops at the last page the count implies.
+PAGE_SIZE = 18
 
 new_tab("about:blank")
 ensure_visible()
@@ -141,12 +204,7 @@ ensure_visible()
 query = "gaming laptop"
 all_items, seen = [], set()
 for page in ROBOTS_PAGES:
-    cards, total, shown_page = load_search_page(query, page)
-    if not cards:
-        if page == 1:
-            raise RuntimeError("page 1 returned no product cards")
-        print(f"page {page}: no products (past the last page, or an error page): stopping")
-        break
+    cards, total, shown_page = fetch_page(query, page)  # raises rather than return a partial crawl
     new = 0
     for c in cards:  # the same SKU can show up as a sponsored and an organic card
         if c["sku"] and c["sku"] not in seen:
@@ -156,6 +214,9 @@ for page in ROBOTS_PAGES:
             new += 1
     print(f"page {page} (site says page {shown_page}): {len(cards)} cards, {new} new, "
           f"{sum(c['price'] is not None for c in cards)} priced, total results {total}")
+    if page >= math.ceil(total / PAGE_SIZE):
+        print(f"page {page} is the last page for {total} results: done")
+        break
     if page != ROBOTS_PAGES[-1]:
         time.sleep(3)  # polite pacing between result pages
 else:
@@ -168,24 +229,32 @@ for item in all_items[:3]:
     print(json.dumps(item))
 ```
 
-Real output (trimmed, 2026-10-23):
+Real output (trimmed, 2026-10-23, latest fresh-browser run):
 
 ```
 page 1 (site says page 1): 24 cards, 20 new, 24 priced, total results 1232
-page 2 (site says page 2): 24 cards, 21 new, 24 priced, total results 1234
-page 3 (site says page 3): 24 cards, 18 new, 24 priced, total results 1234
-page 4 (site says page 4): 24 cards, 21 new, 24 priced, total results 1234
-page 5 (site says page 5): 24 cards, 24 new, 24 priced, total results 1234
-stopped after page 5: robots.txt disallows cp=6 to cp=20 for User-agent: *, so the rest of the 1234 results are not fetched
-104 unique products; Counter({'in_stock': 102, 'sold_out': 1, 'unavailable': 1})
-{"sku": "6674559", "title": "Alienware - 15.3\" 2K Gaming Laptop - AMD Ryzen 200 Series R7 260 2026 - 16GB Memory - NVIDIA GeForce RTX 5050 8GB - 1TB Storage - Black",
- "url": "https://www.bestbuy.com/product/alienware-15-3-2k-gaming-laptop-amd-ryzen-200-series-r7-260-2026-16gb-memory-nvidia-geforce-rtx-5050-8gb-1tb-storage-black/J3K4L6QR6V",
- "price": 1174.99, "regular_price": 1924.99, "on_sale": true, "savings": "Save $750", "rating": 4.6, "review_count": 38,
- "availability": "in_stock", "button": "Add to cart", "pickup": "Pick up in 1 hour", "shipping": "Get it tomorrow • FREE",
+page 2 (site says page 2): 24 cards, 19 new, 24 priced, total results 1235
+page 3 (site says page 3): 24 cards, 19 new, 24 priced, total results 1235
+page 4 (site says page 4): 24 cards, 18 new, 24 priced, total results 1235
+page 5 (site says page 5): 24 cards, 23 new, 24 priced, total results 1235
+stopped after page 5: robots.txt disallows cp=6 to cp=20 for User-agent: *, so the rest of the 1235 results are not fetched
+99 unique products; Counter({'in_stock': 96, 'shop open-box': 2, 'sold_out': 1})
+{"sku": "6623881", "title": "HP - Victus 15.6\" 144Hz Full HD Gaming Laptop - AMD Ryzen 7 7445HS (2023) - 16GB Memory - NVIDIA GeForce RTX 4050 - 512GB SSD - Mica Silver",
+ "url": "https://www.bestbuy.com/product/hp-victus-15-6-144hz-full-hd-gaming-laptop-amd-ryzen-7-7445hs-2023-16gb-memory-nvidia-geforce-rtx-4050-512gb-ssd-mica-silver/JJGH2L8JVV",
+ "price": 949.99, "regular_price": 1474.99, "on_sale": true, "savings": "Save $525", "rating": 4.7, "review_count": 1421,
+ "availability": "in_stock", "button": "Add to cart", "pickup": "Pick up Thu, Oct 29", "shipping": "Get it by Tue, Oct 27 \u2022 FREE",
  "sponsored": false, "page": 1}
 ```
 
-So 5 pages give about 100 unique products; the other ~1,100 results sit on pages robots.txt disallows for `User-agent: *` (`cp=6` to `cp=20`). Narrow the query (or use the official API, below) when you need more than that. Page 1 has no `cp` in the URL; the block checks that the page the site reports (`dioPageData.listPageNum`, else `listResult.pageNumber`) matches the page it asked for and raises if not. Without `cp`, Best Buy rendered page 1 (`listPageNum` 1, the only pagination link pointing to `cp=2`), and `cp=2` shared 3 of about 20 SKUs with it, in line with the cross-page repeats noted under Gotchas.
+An earlier run of the same crawl gave 104 unique products (`in_stock` 102, `sold_out` 1, `unavailable` 1).
+
+So 5 pages give about 100 unique products; the other ~1,100 results sit on pages robots.txt disallows for `User-agent: *` (`cp=6` to `cp=20`). The permitted crawl of a query is capped at those 5 pages; for more, use the official API (see "What does not work"). Page 1 has no `cp` in the URL; the block checks that the page the site reports (`dioPageData.listPageNum`, else `listResult.pageNumber`) matches the page it asked for and raises if not, and it also raises when the site reports no page number or result count. Without `cp`, Best Buy rendered page 1 (`listPageNum` 1, the only pagination link pointing to `cp=2`), and `cp=2` shared 3 of about 20 SKUs with it, in line with the cross-page repeats noted under Gotchas.
+
+How the block ends and fails:
+
+- **Short result sets end on the count.** Best Buy pages 18 organic results at a time (`gaming laptop` pages 1, 2 and 5 each had 24 cards, 6 of them sponsored; 1,236 results gave a last-page link of 69, which is 1,236 / 18 rounded up). After each page the block stops once the page number reaches the reported total / 18, rounded up, so it never requests a page past the end. For `rtx 5090 founders edition` that is page 2 (`cp=2` reported 28 results in one run, 30 in another); `cp=3` there showed "unable to display products" with 0 cards.
+- **Anything else is an error, not the end.** "Unable to display products", no rendered titles, no readable cards, or a missing page number or count on a page the count says exists fails that attempt. Each page gets one 120 s deadline covering all attempts and backoffs (15 s, then 30 s); a retry starts only if at least 40 s would remain after its backoff, so the last attempt is followed by a raise, not a sleep. The error says the results so far are incomplete.
+- **Blocks are not retried.** Before reading a page, `nav()` records the tab's URL, waits until the tab is on a new document whose `location.href` is the requested URL (Best Buy may add `id=pcat17071` and reorder parameters, so `st` and `cp` are compared), and raises at once on HTTP 403 or 429 instead of retrying. Normal pages reported 200.
 
 Counts vary run to run: an earlier run of pages 1-3 had 20 of 24 cards priced on page 1, and in another fresh-browser run page 1 came back with 14 of 24 priced and 9 cards that never rendered at all (`title` and `url` also `null`), even after the 3 revisit passes. Check the `priced` count per page. "Unavailable" and "Sold Out" cards still carry a price once they scroll into view: on an `rtx 5090` search, all 5 "Unavailable" cards on pages 1-3 had a price (e.g. $1,799.99, $799.99). `price` is `null` only when a card never rendered its price block.
 
@@ -219,7 +288,8 @@ Price, regular price, availability, rating, open-box offers and every spec row. 
 # front. Left False, a hidden tab raises instead of taking over your window.
 FOREGROUND_TAB = False
 
-import json
+import json, time
+from urllib.parse import urlparse, parse_qs
 
 PRODUCT_LD = r"""(() => {
   for (const s of document.querySelectorAll('script[type="application/ld+json"]')) {
@@ -252,14 +322,29 @@ def safe_js(expr, tries=6):
             wait(2)
     return None
 
-def nav(url):
+def nav(url, href_ok, timeout=45):
     # Best Buy pages keep the main thread busy; give Page.navigate more than the 5 s default.
     # A tab can hang mid-navigation: stop it and navigate once more (a second timeout raises).
+    end = time.monotonic() + timeout
+    left = lambda: max(1, min(30, end - time.monotonic()))
+    # Record where the tab was and mark that document, so a reload of the same URL is told apart.
+    before = safe_js("(window.__bhOldDoc = true, location.href)", tries=1)
     try:
-        cdp("Page.navigate", url=url, _response_timeout=30)
+        cdp("Page.navigate", url=url, _response_timeout=left())
     except TimeoutError:
-        cdp("Page.stopLoading", _response_timeout=30)
-        cdp("Page.navigate", url=url, _response_timeout=30)
+        cdp("Page.stopLoading", _response_timeout=left())
+        cdp("Page.navigate", url=url, _response_timeout=left())
+    here = None
+    while time.monotonic() < end:  # read nothing until the tab is on a new document at the requested URL
+        wait(1)
+        here = safe_js("({href: location.href, old: !!window.__bhOldDoc,"
+                       " status: (performance.getEntriesByType('navigation')[0] || {}).responseStatus})", tries=1) or here
+        if here and not here["old"] and href_ok(here["href"]):
+            if here["status"] in (403, 429):  # a block: stop, never retry
+                raise RuntimeError(f"HTTP {here['status']} at {here['href']}: blocked, stop and back off")
+            return here["href"]
+    raise RuntimeError(f"navigation to {url} not confirmed within {timeout:.0f} s "
+                       f"(was {before}, now {here['href'] if here else 'unreadable'})")
 
 def ensure_visible():
     if safe_js("document.visibilityState") == "visible":
@@ -299,7 +384,8 @@ MAIN_PRICES = r"""(() => {
 
 def get_product(sku):
     # /site/<sku>.p?skuId=<sku> redirects to the canonical /product/<slug>/<code> URL
-    nav(f"https://www.bestbuy.com/site/{sku}.p?skuId={sku}")
+    nav(f"https://www.bestbuy.com/site/{sku}.p?skuId={sku}",
+        lambda h: urlparse(h).netloc == "www.bestbuy.com" and urlparse(h).path.startswith("/product/"))
     ld, state = None, None
     for _ in range(30):  # JSON-LD arrives with the HTML; the page state and price block hydrate later
         wait(1.5)
@@ -310,6 +396,8 @@ def get_product(sku):
             break
     if not ld:
         return None
+    if str(ld.get("sku")) != str(sku):  # the redirect target must be the product that was asked for
+        raise RuntimeError(f"asked for SKU {sku}, the page is SKU {ld.get('sku')}")
     state = state or {}
     offers = ld.get("offers") or []
     if isinstance(offers, dict):
@@ -356,7 +444,9 @@ def get_product(sku):
 
 ensure_visible()
 # Pick a SKU from a live search so this block does not depend on a hard-coded product.
-nav("https://www.bestbuy.com/site/searchpage.jsp?st=laptop")
+nav("https://www.bestbuy.com/site/searchpage.jsp?st=laptop",
+    lambda h: urlparse(h).path == "/site/searchpage.jsp" and parse_qs(urlparse(h).query).get("st") == ["laptop"]
+    and "cp" not in parse_qs(urlparse(h).query))
 skus = []
 for _ in range(20):
     wait(1.5)
@@ -425,7 +515,7 @@ organic SKUs on page: ['6667483', '13214744', '12341769', '6673811', '6667482']
 
 | Field | Source | Notes |
 |---|---|---|
-| `sku`, `title`, `brand`, `model`, `url` | JSON-LD `Product`: `sku`, `name`, `brand.name`, `model`, `url` | In the initial HTML; there are also `BreadcrumbList` and video `ItemList` JSON-LD blocks |
+| `sku`, `title`, `brand`, `model`, `url` | JSON-LD `Product`: `sku`, `name`, `brand.name`, `model`, `url` | In the initial HTML; there are also `BreadcrumbList` and video `ItemList` JSON-LD blocks. `get_product` first confirms the tab landed on a `/product/` URL, then raises if the JSON-LD `sku` is not the SKU it asked for |
 | `price`, `availability` | JSON-LD `offers[]` entry whose `itemCondition` is `NewCondition` | `availability` is the schema.org suffix, e.g. `InStock` |
 | `other_offers` | other JSON-LD `offers[]` | Open-Box Excellent / Good / Fair |
 | `price_block_price`, `regular_price` | `[data-testid="price-block-customer-price"]` and `[data-testid="price-block-regular-price"]` inside the main product's `[data-testid="bestbuy-price-ui-price-experience"] [data-testid="price-block"]` | `regular_price` (the main block's "Comp. Value: $419.00" line) is `None` when the main product is not discounted. `price_block_price` matched JSON-LD `price` on all 6 laptops checked. Never read these test ids page-wide: warranty, sponsored, "consider" and other product carousels reuse them, and on the undiscounted $699.00 MacBook the first page-wide match was another card's "The price was $419.00". The container appears twice (top and a lower duplicate), both for the main product |
@@ -449,7 +539,7 @@ organic SKUs on page: ['6667483', '13214744', '12341769', '6673811', '6667482']
 ## Gotchas
 
 - **Background tab means endless skeletons.** With `document.visibilityState == "hidden"` the search page stayed at "Main Content / Loading..." with 0 titles and 0 prices for 24 s (rechecked 2026-10-23 in a fresh cloud browser). It stayed that way with `Emulation.setFocusEmulationEnabled(enabled=True)`, and also with `document.visibilityState` and `document.hidden` faked to `visible` / `false` by a script added before navigation. After `activate_tab(current_tab())`, titles rendered within 2 s. A hidden product page got its JSON-LD and `_BBY_DATA_` entry but no main price block in 30 s; it appeared within 2 s of activating the tab. So a visible tab is required, not optional. `activate_tab` brings the tab to the front, which is why the blocks call it only when you set `FOREGROUND_TAB = True` (do that in a dedicated or cloud browser); on your own Chrome leave it `False` and show the tab yourself. Keep one visible working tab and close extras.
-- **Busy main thread.** Right after navigation, `Runtime.evaluate` and `Page.navigate` sometimes exceeded browser-harness's 5 s IPC default (`Runtime.evaluate timed out`, `Page.navigate timed out after 5s`). `DOM.getBoxModel` timed out the same way while clicking "See all specifications". The blocks pass `_response_timeout=30` to those CDP calls and retry on `RuntimeError` or `TimeoutError` (browser-harness raises a `TimeoutError` subclass for IPC timeouts). Once a tab hung mid-navigation (title stuck as the URL, every evaluate timing out); `cdp("Page.stopLoading")` plus a new navigate recovered it, so `nav()` does exactly that when `Page.navigate` times out, and raises if the retry times out too.
+- **Busy main thread.** Right after navigation, `Runtime.evaluate` and `Page.navigate` sometimes exceeded browser-harness's 5 s IPC default (`Runtime.evaluate timed out`, `Page.navigate timed out after 5s`). `DOM.getBoxModel` timed out the same way while clicking "See all specifications". The blocks pass `_response_timeout=30` to those CDP calls and retry on `RuntimeError` or `TimeoutError` (browser-harness raises a `TimeoutError` subclass for IPC timeouts). Once a tab hung mid-navigation (title stuck as the URL, every evaluate timing out); `cdp("Page.stopLoading")` plus a new navigate recovered it, so `nav()` does exactly that when `Page.navigate` times out, and raises if the retry times out too. In a later probe a tab stayed hung even after `Page.stopLoading` and a navigate to `about:blank` (every `Runtime.evaluate` timed out); the search block bounds every wait by its page deadline, so a tab like that ends in an error instead of an endless wait.
 - **Lazy price blocks.** One top-to-bottom scroll left some cards unpriced; scrolling each unpriced card into view filled them in (24 of 24 on pages 2 and 3). The retry includes "Unavailable" and "Sold Out" cards, which do get a price block when in view; the loop gives up after 3 passes, so a card that never renders one keeps `price: null`.
 - **Hydration order on product pages.** JSON-LD is there first; the main price block and `_BBY_DATA_.skus` arrive later (the `isPDP` entry took 12-18 s in one trace, and once did not appear within 20 s). A "See all specifications" click before hydration did nothing, hence the wait and retry.
 - **Store and ZIP come from your IP.** The header shows a nearby store; pickup and shipping text depend on it. A different exit location can change those fields and sometimes ranking.
