@@ -8,7 +8,7 @@ Field-tested against www.bestbuy.com on 2026-10-23 using a Browser Use cloud bro
 - **Use a real browser.** Search results (`/site/searchpage.jsp?st=<query>&cp=<page>`) and product pages render normally in a cloud browser, logged out, no CAPTCHA seen.
 - **Search results are client-rendered and lazy.** Cards get prices only after they scroll into view, so scroll the page, then read the DOM cards (`.product-list-item[data-product-id]`). 20-24 cards per page, sponsored cards included.
 - **Product pages carry JSON-LD `Product`** (SKU, model, brand, price, availability, rating, review count, open-box offers). Full specs sit behind the "See all specifications" button; click it and read the sheet.
-- **The tab must be visible.** A background tab stayed on "Loading..." skeletons; `activate_tab(current_tab())` fixed it.
+- **The tab must be visible.** A background tab stayed on "Loading..." skeletons; `activate_tab(current_tab())` fixed it. The blocks only do that behind an explicit `FOREGROUND_TAB = True` opt-in (fine on a cloud browser); set it to `False` on your own Chrome and they raise on a hidden tab instead of taking over your screen.
 
 ---
 
@@ -66,8 +66,25 @@ def safe_js(expr, tries=6):
     return None
 
 def nav(url):
-    # Best Buy keeps the main thread busy; give Page.navigate more than the 5 s default
-    cdp("Page.navigate", url=url, _response_timeout=30)
+    # Best Buy keeps the main thread busy; give Page.navigate more than the 5 s default.
+    # A tab can hang mid-navigation: stop it and navigate once more (a second timeout raises).
+    try:
+        cdp("Page.navigate", url=url, _response_timeout=30)
+    except TimeoutError:
+        cdp("Page.stopLoading", _response_timeout=30)
+        cdp("Page.navigate", url=url, _response_timeout=30)
+
+# Best Buy never renders in a hidden (background) tab, and new_tab() opens a hidden one.
+# Bringing it to the front is an explicit opt-in: fine on a cloud browser, but on your own
+# Chrome it takes over the tab you are looking at. With False, a hidden tab raises instead.
+FOREGROUND_TAB = True
+
+def ensure_visible():
+    if safe_js("document.visibilityState") == "visible":
+        return
+    if not FOREGROUND_TAB:
+        raise RuntimeError("tab is hidden and Best Buy will not render it: show the tab yourself or set FOREGROUND_TAB = True")
+    activate_tab(current_tab())
 
 def load_search_page(query, page=1):
     nav(f"https://www.bestbuy.com/site/searchpage.jsp?st={quote_plus(query)}&cp={page}")
@@ -94,11 +111,15 @@ def load_search_page(query, page=1):
             wait(0.8)
         wait(1.5)
     cards = safe_js(EXTRACT_CARDS) or []
-    total = safe_js("((window._BBY_DATA_ || {}).listResult || {}).count || (window.dioPageData || {}).searchResultsNum || null")
+    # listResult.count is sometimes {} and searchResultsNum is "" until hydrated: accept numbers only
+    total = safe_js("""(() => {
+      const c = ((window._BBY_DATA_ || {}).listResult || {}).count, n = (window.dioPageData || {}).searchResultsNum;
+      return Number.isFinite(c) ? c : Number.isFinite(n) ? n : null;
+    })()""")
     return cards, total
 
 new_tab("about:blank")
-activate_tab(current_tab())  # a hidden (background) tab stays on "Loading..." skeletons
+ensure_visible()
 
 query = "gaming laptop"
 all_items, seen = [], set()
@@ -154,7 +175,7 @@ Counts vary run to run: a second run of the same block minutes later gave 24/24 
 | `pickup`, `shipping` | `[data-testid^="plp-pickup-messaging-"]`, `[data-testid^="plp-shipping-messaging-"]` | e.g. "Pick up in 1 hour", "Get it tomorrow • FREE", "Unavailable"; depends on the store Best Buy assigns to your IP |
 | `sponsored` | card is inside `li.slContainer` | Dedupe on `sku` |
 
-Page level: total result count is `window._BBY_DATA_.listResult.count` (sometimes an empty object), fallback `window.dioPageData.searchResultsNum`. `window._BBY_DATA_.skus` lists the page's SKUs in rank order with `isSponsored` flags before the cards finish rendering.
+Page level: total result count is `window._BBY_DATA_.listResult.count` (sometimes an empty object), fallback `window.dioPageData.searchResultsNum` (an empty string until the page hydrates). The block takes whichever is a number, else `null`. `window._BBY_DATA_.skus` lists the page's SKUs in rank order with `isSponsored` flags before the cards finish rendering.
 
 ---
 
@@ -197,8 +218,22 @@ def safe_js(expr, tries=6):
     return None
 
 def nav(url):
-    # Best Buy pages keep the main thread busy; give Page.navigate more than the 5 s default
-    cdp("Page.navigate", url=url, _response_timeout=30)
+    # Best Buy pages keep the main thread busy; give Page.navigate more than the 5 s default.
+    # A tab can hang mid-navigation: stop it and navigate once more (a second timeout raises).
+    try:
+        cdp("Page.navigate", url=url, _response_timeout=30)
+    except TimeoutError:
+        cdp("Page.stopLoading", _response_timeout=30)
+        cdp("Page.navigate", url=url, _response_timeout=30)
+
+FOREGROUND_TAB = True  # explicit opt-in, same as the search block: a hidden tab never hydrates
+
+def ensure_visible():
+    if safe_js("document.visibilityState") == "visible":
+        return
+    if not FOREGROUND_TAB:
+        raise RuntimeError("tab is hidden and Best Buy will not render it: show the tab yourself or set FOREGROUND_TAB = True")
+    activate_tab(current_tab())
 
 def click_button_named(name):
     try:  # every CDP call here can exceed the 5 s default while the page is busy
@@ -285,7 +320,7 @@ def get_product(sku):
         "specs": specs,
     }
 
-activate_tab(current_tab())  # a hidden (background) tab never hydrates
+ensure_visible()
 # Pick a SKU from a live search so this block does not depend on a hard-coded product.
 nav("https://www.bestbuy.com/site/searchpage.jsp?st=laptop")
 skus = []
@@ -378,8 +413,8 @@ organic SKUs on page: ['6667483', '13214744', '12341769', '6673811', '6667482']
 
 ## Gotchas
 
-- **Background tab means endless skeletons.** With `document.visibilityState == "hidden"` the search page stayed at "Main Content / Loading..." with 0 titles for 20+ s. After `activate_tab(current_tab())`, 16 titles rendered within 2 s. Keep one visible working tab and close extras.
-- **Busy main thread.** Right after navigation, `Runtime.evaluate` and `Page.navigate` sometimes exceeded browser-harness's 5 s IPC default (`Runtime.evaluate timed out`, `Page.navigate timed out after 5s`). `DOM.getBoxModel` timed out the same way while clicking "See all specifications". The blocks pass `_response_timeout=30` to those CDP calls and retry on `RuntimeError` or `TimeoutError` (browser-harness raises a `TimeoutError` subclass for IPC timeouts). Once a tab hung mid-navigation (title stuck as the URL, every evaluate timing out); `cdp("Page.stopLoading")` plus a new navigate recovered it.
+- **Background tab means endless skeletons.** With `document.visibilityState == "hidden"` the search page stayed at "Main Content / Loading..." with 0 titles for 24 s (rechecked 2026-10-23). After `activate_tab(current_tab())`, titles rendered within 2 s. `activate_tab` brings the tab to the front, so the blocks call it only when `FOREGROUND_TAB = True`; that is safe on a cloud browser, while on your own Chrome you should set `False` and show the tab yourself. Keep one visible working tab and close extras.
+- **Busy main thread.** Right after navigation, `Runtime.evaluate` and `Page.navigate` sometimes exceeded browser-harness's 5 s IPC default (`Runtime.evaluate timed out`, `Page.navigate timed out after 5s`). `DOM.getBoxModel` timed out the same way while clicking "See all specifications". The blocks pass `_response_timeout=30` to those CDP calls and retry on `RuntimeError` or `TimeoutError` (browser-harness raises a `TimeoutError` subclass for IPC timeouts). Once a tab hung mid-navigation (title stuck as the URL, every evaluate timing out); `cdp("Page.stopLoading")` plus a new navigate recovered it, so `nav()` does exactly that when `Page.navigate` times out, and raises if the retry times out too.
 - **Lazy price blocks.** One top-to-bottom scroll left some cards unpriced; scrolling each unpriced card into view filled them in (24 of 24 on pages 2 and 3). The retry includes "Unavailable" and "Sold Out" cards, which do get a price block when in view; the loop gives up after 3 passes, so a card that never renders one keeps `price: null`.
 - **Hydration order on product pages.** JSON-LD is there first; the main price block and `_BBY_DATA_.skus` arrive later (the `isPDP` entry took 12-18 s in one trace, and once did not appear within 20 s). A "See all specifications" click before hydration did nothing, hence the wait and retry.
 - **Store and ZIP come from your IP.** The header shows a nearby store; pickup and shipping text depend on it. A different exit location can change those fields and sometimes ranking.

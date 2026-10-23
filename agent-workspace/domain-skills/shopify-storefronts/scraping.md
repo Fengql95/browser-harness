@@ -4,12 +4,12 @@ Field-tested against www.allbirds.com, colourpop.com, www.deathwishcoffee.com, w
 
 ## Quick summary
 
-- Most Shopify stores run on the standard Online Store theme engine and serve the whole public catalog as JSON at `/products.json?limit=250&page=N`. No browser, no auth, no API key. Observed: Allbirds 692 products / 7,454 variants in 3 pages, ColourPop 1,064 in 5 pages, tentree 1,847 / 8,203 variants in 8 pages, Death Wish Coffee 153 in 1 page.
+- Most Shopify stores run on the standard Online Store theme engine and serve the whole public catalog as JSON at `/products.json?limit=250&page=N`. No browser, no auth, no API key. Observed: Allbirds 461 products / 5,288 variants in 2 pages, ColourPop 1,064 in 5 pages, tentree 1,847 / 8,203 variants in 8 pages, Death Wish Coffee 153 in 1 page.
 - Pagination ends with an empty `{"products":[]}` page (HTTP 200). `limit` is capped at 250 (asking for 500 returned 250).
 - Hard cap: `page * limit` may not exceed 25,000. kith.com returned 250 products on page 100 and `400 {"errors":"Page * Limit exceeds the 25000 limit."}` on page 101. For bigger stores, enumerate handles from `/sitemap.xml` -> `sitemap_products_N.xml` and fetch `/products/<handle>.js`.
 - `/products/<handle>.js` adds fields the list endpoint lacks: prices in cents, `barcode`, `inventory_management`, `inventory_policy`, and on some stores `inventory_quantity`.
 - Headless Shopify stores (Hydrogen/Oxygen, Next.js) do not serve `/products.json`: fashionnova.com returned 404, gymshark.com returned 403 (CloudFront), in both plain HTTP and an in-page browser `fetch`. Their product pages do embed a schema.org `ProductGroup` in JSON-LD with per-variant SKU, price, currency and availability, and their sitemaps list every product URL.
-- Browser fallback: open the storefront and call `fetch('/products.json?...')` from the page (same origin). On allbirds.com this returned the same 250/250/192/0 pages as plain HTTP.
+- Browser fallback: open the storefront and call `fetch('/products.json?...')` from the page (same origin). On allbirds.com this returned the same 250/211/0 pages as plain HTTP.
 
 ## Detect which kind of store you have
 
@@ -26,17 +26,33 @@ Field-tested against www.allbirds.com, colourpop.com, www.deathwishcoffee.com, w
 
 ### 1. Full catalog via `/products.json` (plain Python, no browser)
 
-Stdlib only. Paginates until the empty page, stops cleanly on the 25,000 cap, retries 429/5xx with `Retry-After`, and writes one row per variant.
+Stdlib only. Paginates until the empty page, reports the 25,000 cap when it stops there, retries 429/5xx and network errors with `Retry-After` (seconds or HTTP-date) or exponential backoff, raises when retries run out, dedupes on product `id`, and writes one row per variant.
 
 ```python
-import json, time, gzip, urllib.request, urllib.error
+import json, time, gzip, email.utils, urllib.request, urllib.error
+from datetime import datetime, timezone
 
 STORE = "https://www.deathwishcoffee.com"   # any Shopify storefront origin, no trailing slash
-UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
+UA = "browser-harness-skill-example"        # a truthful client UA; every Online Store store tested returned 200 to it
+
+def retry_delay(value, attempt):
+    """Retry-After is either delay-seconds or an HTTP-date; fall back to exponential backoff."""
+    if value:
+        try:
+            return min(120.0, max(0.0, float(value)))
+        except ValueError:
+            try:
+                when = email.utils.parsedate_to_datetime(value)
+                return min(120.0, max(0.0, (when - datetime.now(timezone.utc)).total_seconds()))
+            except (TypeError, ValueError):
+                pass
+    return 2 ** (attempt + 1)
 
 def get_json(url, tries=4):
-    """Return (status, parsed_json_or_error_text)."""
+    """Return (status, parsed_json_or_error_text). Raises if 429/5xx/network errors persist."""
     for attempt in range(tries):
+        if attempt:
+            time.sleep(delay)
         req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json", "Accept-Encoding": "gzip"})
         try:
             with urllib.request.urlopen(req, timeout=30) as r:
@@ -49,13 +65,15 @@ def get_json(url, tries=4):
                     return r.status, "not JSON: " + data[:120].decode("utf-8", "replace")
         except urllib.error.HTTPError as e:
             if e.code == 429 or e.code >= 500:
-                time.sleep(float(e.headers.get("Retry-After") or 2 ** (attempt + 1)))
+                last, delay = f"HTTP {e.code}", retry_delay(e.headers.get("Retry-After"), attempt)
                 continue
             body = e.read()
             if e.headers.get("Content-Encoding") == "gzip":
                 body = gzip.decompress(body)
             return e.code, body[:200].decode("utf-8", "replace")
-    return 429, "gave up after retries"
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+            last, delay = repr(e), retry_delay(None, attempt)
+    raise RuntimeError(f"{url}: still failing after {tries} tries ({last})")
 
 def fetch_catalog(store, limit=250, pause=1.0):
     products, page = [], 1
@@ -73,7 +91,10 @@ def fetch_catalog(store, limit=250, pause=1.0):
         print(f"page {page}: {len(batch)} products")
         page += 1
         time.sleep(pause)
-    return products
+    unique = list({p["id"]: p for p in products}.values())   # rows can shift between pages if the store edits mid-crawl
+    if len(unique) != len(products):
+        print(f"dropped {len(products) - len(unique)} duplicate products")
+    return unique
 
 def variant_rows(p, store):
     images = p.get("images") or []
@@ -99,7 +120,7 @@ with open(out, "w") as f:
     for r in rows:
         f.write(json.dumps(r) + "\n")
 print(len(products), "products,", len(rows), "variants ->", out)
-print(json.dumps(rows[0], indent=1)[:900])
+print(json.dumps(rows[0], indent=1)[:900] if rows else "store has no public products")
 ```
 
 Observed output (trimmed, Death Wish Coffee):
@@ -128,7 +149,7 @@ page 1: 153 products
 }
 ```
 
-Same code against `https://www.allbirds.com` printed `page 1: 250`, `page 2: 250`, `page 3: 192`, then `692 products, 7454 variants`. Each 250-product page took 0.2-1.5 s and was 0.6-4.5 MB.
+Same code against `https://www.allbirds.com` printed `page 1: 250`, `page 2: 211`, then `461 products, 5288 variants`. Each 250-product page took 0.2-1.5 s and was 0.6-4.5 MB.
 
 ### 2. One product in detail via `/products/<handle>.js`
 
@@ -138,7 +159,7 @@ Prices here are integer cents. `inventory_quantity` is present on some stores an
 import json, gzip, urllib.request, urllib.parse
 
 STORE = "https://colourpop.com"
-UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
+UA = "browser-harness-skill-example"
 
 def get(url):
     req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json", "Accept-Encoding": "gzip"})
@@ -178,7 +199,7 @@ Observed `inventory_quantity` values: ColourPop 3750, Death Wish 100, Allbirds 0
 import re, json, time, gzip, urllib.request, urllib.parse
 
 STORE = "https://kith.com"
-UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
+UA = "browser-harness-skill-example"
 SAMPLE = 5   # raise for a full crawl; budget ~1 s per product
 
 def get(url, accept="application/xml"):
@@ -222,7 +243,9 @@ STORE = "https://www.allbirds.com"
 
 PAGE_JS = """
 (async (page) => {
-  const r = await fetch('/products.json?limit=250&page=' + page, {headers: {Accept: 'application/json'}});
+  let r;
+  try { r = await fetch('/products.json?limit=250&page=' + page, {headers: {Accept: 'application/json'}}); }
+  catch (e) { return JSON.stringify({status: 0, rows: null}); }   // network error
   if (!r.ok) return JSON.stringify({status: r.status, rows: null});
   const d = await r.json();
   const rows = [];
@@ -239,12 +262,22 @@ new_tab(STORE + "/")
 wait_for_load()
 print("shop:", js("(window.Shopify && window.Shopify.shop) || null"), "| currency:", js("(window.Shopify && window.Shopify.currency && window.Shopify.currency.active) || null"))
 
-rows, page = [], 1
+rows, page, retries = [], 1, 0
 while True:
     res = json.loads(js(PAGE_JS % page))
-    if res["rows"] is None:
-        print("page", page, "status", res["status"], "- stop (400 = 25,000 cap, 403/404 = headless or blocked)")
+    status = res["status"]
+    if status in (0, 429) or status >= 500:   # transient: back off and retry the same page
+        retries += 1
+        if retries > 4:
+            raise RuntimeError(f"page {page}: status {status} after 4 retries; catalog incomplete")
+        time.sleep(2 ** retries)
+        continue
+    if status == 400:
+        print(f"page {page}: 400 = 25,000 product cap; catalog truncated, use block 3 (sitemaps) for the rest")
         break
+    if res["rows"] is None:
+        raise RuntimeError(f"page {page}: status {status} (403/404 = headless or blocked)")
+    retries = 0
     if res["products"] == 0:
         break
     rows += res["rows"]
@@ -259,9 +292,8 @@ Observed output (allbirds.com):
 ```text
 shop: weareallbirds.myshopify.com | currency: USD
 page 1 250 products
-page 2 250 products
-page 3 192 products
-7454 variant rows; first: {'handle': 'womens-allbirds-flip-flop-dusty-pink', 'title': "Women's Allbirds Flip Flop - Dusty Pink", 'vendor': 'Allbirds', 'product_type': 'Shoes', ..., 'price': '25.00', 'compare_at_price': '50.00', 'available': False, ...}
+page 2 211 products
+5288 variant rows; first: {'handle': 'mens-runner-nz-tweed', 'title': "Men's Runner NZ Tweed - Dark Grey (Stormy Grey Sole)", 'vendor': 'Allbirds', 'product_type': 'Shoes', ..., 'price': '120.00', 'compare_at_price': None, 'available': False, ...}
 ```
 
 ### 5. Headless stores: sitemap + product-page JSON-LD in the browser
@@ -273,7 +305,7 @@ import json, re, time
 
 STORE = "https://www.gymshark.com"
 SAMPLE = 3   # product pages to visit; keep pacing >= 2 s per page
-UA = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"}
+UA = {"User-Agent": "browser-harness-skill-example"}   # gymshark's sitemap returned 403 to the bare Python urllib UA, 200 to this
 
 def locs(xml):
     return [u.replace("&amp;", "&") for u in re.findall(r"<loc>\s*([^<\s]+)\s*</loc>", xml)]
@@ -295,6 +327,14 @@ JSON.stringify([...document.querySelectorAll('script[type="application/ld+json"]
 }))
 """
 
+def image_url(img):
+    """schema.org image: a URL string, an ImageObject dict, or a list of either."""
+    if isinstance(img, list):
+        img = img[0] if img else None
+    if isinstance(img, dict):
+        img = img.get("url") or img.get("contentUrl")
+    return img
+
 def to_rows(item, page_url):
     variants = item.get("hasVariant") or [item]
     brand = item.get("brand")
@@ -307,7 +347,7 @@ def to_rows(item, page_url):
                "size": v.get("size") if not isinstance(v.get("size"), dict) else v["size"].get("name"),
                "color": v.get("color"), "price": offer.get("price"), "currency": offer.get("priceCurrency"),
                "availability": (offer.get("availability") or "").rsplit("/", 1)[-1] or None,
-               "image": v.get("image") if isinstance(v.get("image"), str) else (v.get("image") or [None])[0],
+               "image": image_url(v.get("image") or item.get("image")),
                "url": page_url}
 
 print(len(maps), "product sitemap(s),", len(urls), "product URLs")
@@ -327,7 +367,7 @@ print(rows[0] if rows else "no Product JSON-LD found")
 Observed output (gymshark.com, trimmed):
 
 ```text
-1 product sitemap(s), 3004 product URLs
+1 product sitemap(s), 2984 product URLs
 gift-card -> 4 variants
 gymshark-fit-seamless-cropped-leggings-smokey-grey -> 5 variants
 gymshark-1-3-litre-water-bottle-black -> 1 variants
@@ -371,13 +411,13 @@ Extra in `/products/<handle>.js`: `price`, `price_min`, `price_max`, `compare_at
 
 - Use the store's real public domain. Market-prefixed paths did not work: `/en-ca/products.json` returned 404 on tentree, allbirds and colourpop, and a 301 to a blog page on kith.
 - `since_id` is ignored on the storefront endpoint: `?limit=5&since_id=1` returned the same first 5 products as without it. Use `page`.
-- Default sort is not by id. Allbirds page 1 started with the newest products. If the store edits products mid-crawl, rows can shift between pages; dedupe on `id` (all 4 full crawls here had 0 duplicates).
+- Default sort is not by id (Allbirds' list is in neither ascending nor descending id order). If the store edits products mid-crawl, rows can shift between pages; block 1 dedupes on `id` and reports any drops (the full crawls here had 0 duplicates).
 - Collections: `/collections.json?limit=250` lists collections with `products_count` (Death Wish: 126), and `/collections/<handle>/products.json` has the same shape. `/collections/all/products.json` returned the full 153 products. Some collections are empty (returned 0).
 - Error bodies are gzip-encoded when you send `Accept-Encoding: gzip`; decompress before reading the 400 cap message.
 - Unknown handles: `/products/<missing>.js` returns 404.
-- Every request in this run sent a normal desktop Chrome User-Agent and got 200 from every Online Store store. No 429 was observed (roughly 100 requests across 8 stores, paced 0.5-1 s apart), so keep that pace and honor `Retry-After` if one appears.
+- No browser User-Agent is needed: the truthful UA `browser-harness-skill-example` got 200 from every Online Store store and from both headless sitemaps. The bare Python urllib UA also worked except on gymshark's sitemap (403). No 429 was observed (roughly 100 requests across 8 stores, paced 0.5-1 s apart), so keep that pace and honor `Retry-After` if one appears.
 - Prices are in the storefront's default currency (USD on every store tested; `window.Shopify.currency.active` shows it in the browser). The `.js` endpoint returns cents, the `.json` list returns decimal strings.
-- Headless store JSON-LD is per product page, so a full crawl costs one page load per product: fashionnova's product sitemap had 37,840 URLs, gymshark's 3,004. Budget time accordingly and pace at >= 2 s per page.
+- Headless store JSON-LD is per product page, so a full crawl costs one page load per product: fashionnova's product sitemap had 37,840 URLs, gymshark's 2,984. Budget time accordingly and pace at >= 2 s per page.
 - Gymshark's sitemap index also lists localized copies (`/es-US/sitemap_products_1.xml`); block 5 filters `xx-YY` locale paths to avoid duplicates.
 
 ## What does not work

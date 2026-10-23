@@ -1,11 +1,11 @@
 # Redfin — For-sale listings by city or ZIP, plus listing details
 
-Field-tested against www.redfin.com on 2026-10-23 using a Browser Use cloud browser and plain-Python HTTP (urllib).
+Field-tested against www.redfin.com on 2026-10-23 (re-run after the retry/raise changes the same day) using a Browser Use cloud browser and plain-Python HTTP (urllib).
 
 ## Quick summary
 
 - Redfin's own map/list UI is fed by a same-origin JSON endpoint, `/stingray/api/gis`. Called from inside a Redfin tab with `fetch()`, it returned every for-sale home in a region: address, price, beds, baths, sqft, status, lat/long and URL, plus remarks, key facts, tags, HOA, lot size and year built.
-- Pagination is `start=<offset>` with `num_homes=<page size>`. `page_number` is ignored. The city of Austin, TX returned 5,795 unique homes in 17 calls of 350 (about 61 s with a 2 s pause).
+- Pagination is `start=<offset>` with `num_homes=<page size>`. `page_number` is ignored. The city of Austin, TX returned 5,793 unique homes in 17 calls of 350 (about 61 s with a 2 s pause).
 - City / ZIP / neighborhood / county text is turned into a `region_id` + `region_type` with `/stingray/do/location-autocomplete`, also called from the tab.
 - Listing detail pages carry a `["Product", "RealEstateListing"]` JSON-LD block (price, beds, baths, sqft, year built, geo, photos, description). Three more same-origin endpoints add status, lot size, full/half baths and every MLS fact group.
 - Plain HTTP (no browser): `/stingray/api/gis` answered 200 to urllib, so bulk search works without a browser once you know the region id. Autocomplete, detail pages and the detail APIs did not (403 / 202 empty), so use the browser for those.
@@ -21,28 +21,32 @@ import json, time, csv, os, tempfile, urllib.parse
 
 QUERY = "Austin, TX"        # a city, a ZIP ("78704"), a neighborhood or a county
 PAGE_SIZE = 350             # the page size Redfin's own map uses
-MAX_PAGES = 30              # safety cap; Austin needed 17 pages
+MAX_PAGES = 30              # safety cap (raises if hit); Austin needed 17 pages
 PAUSE = 2.0                 # seconds between API calls
 
 new_tab("https://www.redfin.com/")
 wait_for_load(30)
 
-def rf(path, timeout=60):
-    """GET a same-origin /stingray endpoint from inside the Redfin tab. Returns parsed JSON or None.
-    The fetch runs in the page and is polled, because a single js() call gives up after about 5 s."""
-    k = json.dumps("__rf_%d" % time.time_ns())
-    js("window[%s] = null; fetch(%s).then(async r => { window[%s] = JSON.stringify({status: r.status, text: await r.text()}); })"
-       ".catch(e => { window[%s] = JSON.stringify({status: 0, text: String(e)}); }); 1" % (k, json.dumps(path), k, k))
-    raw, deadline = None, time.time() + timeout
-    while not raw and time.time() < deadline:
-        time.sleep(0.5)
-        raw = js("window[%s]" % k)
-    js("delete window[%s]; 1" % k)
-    r = json.loads(raw) if raw else {"status": "timeout", "text": ""}
-    if r["status"] != 200 or not r["text"].startswith("{}&&"):
-        print("stingray failed", r["status"], path[:90], r["text"][:120])
-        return None
-    return json.loads(r["text"][4:])      # strip the "{}&&" prefix
+def rf(path, timeout=60, tries=3):
+    """GET a same-origin /stingray endpoint from inside the Redfin tab and return parsed JSON.
+    The fetch runs in the page and is polled, because a single js() call gives up after about 5 s.
+    Retries with backoff (5 s, 10 s), then raises, so a failed call never looks like an empty result."""
+    for attempt in range(tries):
+        k = json.dumps("__rf_%d" % time.time_ns())
+        js("window[%s] = null; fetch(%s).then(async r => { window[%s] = JSON.stringify({status: r.status, text: await r.text()}); })"
+           ".catch(e => { window[%s] = JSON.stringify({status: 0, text: String(e)}); }); 1" % (k, json.dumps(path), k, k))
+        raw, deadline = None, time.time() + timeout
+        while not raw and time.time() < deadline:
+            time.sleep(0.5)
+            raw = js("window[%s]" % k)
+        js("delete window[%s]; 1" % k)
+        r = json.loads(raw) if raw else {"status": "timeout", "text": ""}
+        if r["status"] == 200 and r["text"].startswith("{}&&"):
+            return json.loads(r["text"][4:])      # strip the "{}&&" prefix
+        print(f"stingray try {attempt + 1}/{tries} failed:", r["status"], path[:90], r["text"][:120])
+        if attempt + 1 < tries:
+            time.sleep(5 * 2 ** attempt)
+    raise RuntimeError(f"stingray call failed {tries} times: {path[:120]}")
 
 # autocomplete row type -> gis region_type
 REGION_TYPE = {"2": 6, "4": 2, "6": 1, "5": 5}   # city, zip, neighborhood, county
@@ -88,14 +92,18 @@ rows, seen = [], set()
 for page in range(MAX_PAGES):
     time.sleep(PAUSE)
     d = rf("/stingray/api/gis?" + urllib.parse.urlencode(dict(q, start=page * PAGE_SIZE)))
-    homes = (d or {}).get("payload", {}).get("homes", [])
+    homes = (d.get("payload") or {}).get("homes")
+    if d.get("resultCode") != 0 or homes is None:
+        raise RuntimeError(f"gis page {page + 1} returned no homes list: {str(d)[:200]}")
     for h in homes:
         if h.get("propertyId") not in seen:
             seen.add(h.get("propertyId"))
             rows.append(flatten(h))
     print(f"page {page + 1}: {len(homes)} homes, {len(rows)} unique so far")
-    if len(homes) < PAGE_SIZE:
+    if len(homes) < PAGE_SIZE:          # a short successful page is the only end signal
         break
+else:
+    raise RuntimeError(f"hit MAX_PAGES={MAX_PAGES} with full pages; {len(rows)} rows so far. Raise MAX_PAGES and rerun.")
 
 out = os.path.join(tempfile.gettempdir(), "redfin_listings")
 with open(out + ".json", "w") as f:
@@ -113,12 +121,12 @@ Observed output (trimmed):
 
 ```text
 region {'region_id': 30818, 'region_type': 6, 'name': 'Austin', 'sub': 'Austin, TX, USA', 'url': '/city/30818/TX/Austin'}
-site count: 5793 + 120 early access
+site count: 5791 + 119 early access
 page 1: 350 homes, 350 unique so far
 ...
 page 16: 350 homes, 5600 unique so far
-page 17: 195 homes, 5795 unique so far
-saved 5795 rows to /tmp/.../redfin_listings.json and .csv
+page 17: 193 homes, 5793 unique so far
+saved 5793 rows to /tmp/.../redfin_listings.json and .csv
 [
  {"property_id": 32017342, "listing_id": 224635318, "mls_id": "8807705",
   "address": "3305 Tavistock Dr", "city": "Austin", "state": "TX", "zip": "78748",
@@ -131,9 +139,9 @@ saved 5795 rows to /tmp/.../redfin_listings.json and .csv
 ]
 ```
 
-With `QUERY = "78704"` autocomplete returned row id `4_34098`, so the ZIP searches as `region_id=34098, region_type=2` (the ZIP itself is not the region id). That ZIP returned 331 homes (the page header said "321 homes + 10 early access"). `"Travis County, TX"` resolved to `/county/2866/TX/Travis-County` (`region_id=2866, region_type=5`).
+With `QUERY = "78704"` autocomplete returned row id `4_34098`, so the ZIP searches as `region_id=34098, region_type=2` (the ZIP itself is not the region id). That ZIP returned 331 homes (the page header said "321 homes + 10 early access"; 332 on the re-run). `"Travis County, TX"` resolved to `/county/2866/TX/Travis-County` (`region_id=2866, region_type=5`).
 
-Null counts across the 5,795 Austin rows: address 18 (undisclosed-address listings), price 17, beds 17, baths 346, sqft 418, lot_sqft 908, year_built 922, hoa_month 2,876, days_on_market 120 (all Coming Soon). Status values: Active 5,671, Coming Soon 120, Price Change 2, New 1, Back on Market 1. lat/lon and url were never null.
+Null counts across the 5,793 Austin rows: address 18 (undisclosed-address listings), price 17, beds 17, baths 346, sqft 418, lot_sqft 906, year_built 922, hoa_month 2,877, days_on_market 119 (118 of them Coming Soon). Status values: Active 5,670, Coming Soon 119, Price Change 2, New 1, Back on Market 1. lat/lon and url were never null.
 
 ### 2. Key facts from a listing detail page (browser)
 
@@ -153,22 +161,26 @@ if not page_info()["url"].startswith("https://www.redfin.com"):
     new_tab("https://www.redfin.com/")
     wait_for_load(30)
 
-def rf(path, timeout=60):
-    """GET a same-origin /stingray endpoint from inside the Redfin tab. Returns parsed JSON or None.
-    The fetch runs in the page and is polled, because a single js() call gives up after about 5 s."""
-    k = json.dumps("__rf_%d" % time.time_ns())
-    js("window[%s] = null; fetch(%s).then(async r => { window[%s] = JSON.stringify({status: r.status, text: await r.text()}); })"
-       ".catch(e => { window[%s] = JSON.stringify({status: 0, text: String(e)}); }); 1" % (k, json.dumps(path), k, k))
-    raw, deadline = None, time.time() + timeout
-    while not raw and time.time() < deadline:
-        time.sleep(0.5)
-        raw = js("window[%s]" % k)
-    js("delete window[%s]; 1" % k)
-    r = json.loads(raw) if raw else {"status": "timeout", "text": ""}
-    if r["status"] != 200 or not r["text"].startswith("{}&&"):
-        print("stingray failed", r["status"], path[:90], r["text"][:120])
-        return None
-    return json.loads(r["text"][4:])      # strip the "{}&&" prefix
+def rf(path, timeout=60, tries=3):
+    """GET a same-origin /stingray endpoint from inside the Redfin tab and return parsed JSON.
+    The fetch runs in the page and is polled, because a single js() call gives up after about 5 s.
+    Retries with backoff (5 s, 10 s), then raises, so a failed call never looks like an empty result."""
+    for attempt in range(tries):
+        k = json.dumps("__rf_%d" % time.time_ns())
+        js("window[%s] = null; fetch(%s).then(async r => { window[%s] = JSON.stringify({status: r.status, text: await r.text()}); })"
+           ".catch(e => { window[%s] = JSON.stringify({status: 0, text: String(e)}); }); 1" % (k, json.dumps(path), k, k))
+        raw, deadline = None, time.time() + timeout
+        while not raw and time.time() < deadline:
+            time.sleep(0.5)
+            raw = js("window[%s]" % k)
+        js("delete window[%s]; 1" % k)
+        r = json.loads(raw) if raw else {"status": "timeout", "text": ""}
+        if r["status"] == 200 and r["text"].startswith("{}&&"):
+            return json.loads(r["text"][4:])      # strip the "{}&&" prefix
+        print(f"stingray try {attempt + 1}/{tries} failed:", r["status"], path[:90], r["text"][:120])
+        if attempt + 1 < tries:
+            time.sleep(5 * 2 ** attempt)
+    raise RuntimeError(f"stingray call failed {tries} times: {path[:120]}")
 
 def strip_tags(s):
     return re.sub(r"<[^>]+>", "", s or "").strip()
@@ -207,31 +219,36 @@ def listing_details(url):
         "photos": [i.get("url") for i in me.get("image", [])],
         "description": (ld or {}).get("description", "").strip(),
     }
-    # 2) ids for the detail APIs, from the page path
+    # 2) ids for the detail APIs, from the page path. rf() raises after retries, and a missing
+    #    payload raises here too, so a failed endpoint never comes back as empty-looking fields.
     path = urllib.parse.urlparse(url).path
-    info = rf("/stingray/api/home/details/initialInfo?" + urllib.parse.urlencode({"path": path}))
-    p = (info or {}).get("payload", {})
+    p = rf("/stingray/api/home/details/initialInfo?" + urllib.parse.urlencode({"path": path})).get("payload") or {}
     pid, lid = p.get("propertyId"), p.get("listingId")
-    if pid:
-        q = urllib.parse.urlencode({"propertyId": pid, "listingId": lid or "", "accessLevel": 1})
-        time.sleep(1)
-        atf = (rf("/stingray/api/home/details/aboveTheFold?" + q) or {}).get("payload", {}).get("addressSectionInfo", {})
-        facts.update({
-            "property_id": pid, "listing_id": lid, "mls_id": p.get("mlsId"),
-            "status": (atf.get("status") or {}).get("displayValue"),
-            "lot_sqft": atf.get("lotSize"),
-            "price_per_sqft": atf.get("pricePerSqFt"),
-            "full_baths": atf.get("numFullBaths"), "half_baths": atf.get("numPartialBaths"),
-        })
-        time.sleep(1)
-        btf = (rf("/stingray/api/home/details/belowTheFold?" + q) or {}).get("payload", {})
-        groups = {}
-        for sg in (btf.get("amenitiesInfo") or {}).get("superGroups", []):
-            for g in sg.get("amenityGroups", []):
-                for e in g.get("amenityEntries", []):
-                    vals = ", ".join(strip_tags(x) for x in e.get("amenityValues", []))
-                    groups.setdefault(g.get("groupTitle") or "untitled", []).append(f'{e.get("amenityName") or e.get("referenceName")}: {vals}')
-        facts["mls_details"] = groups
+    if not pid:
+        raise RuntimeError(f"initialInfo returned no propertyId for {url}")
+    q = urllib.parse.urlencode({"propertyId": pid, "listingId": lid or "", "accessLevel": 1})
+    time.sleep(1)
+    atf = (rf("/stingray/api/home/details/aboveTheFold?" + q).get("payload") or {}).get("addressSectionInfo")
+    if not atf:
+        raise RuntimeError(f"aboveTheFold returned no addressSectionInfo for {url}")
+    facts.update({
+        "property_id": pid, "listing_id": lid, "mls_id": p.get("mlsId"),
+        "status": (atf.get("status") or {}).get("displayValue"),
+        "lot_sqft": atf.get("lotSize"),
+        "price_per_sqft": atf.get("pricePerSqFt"),
+        "full_baths": atf.get("numFullBaths"), "half_baths": atf.get("numPartialBaths"),
+    })
+    time.sleep(1)
+    btf = rf("/stingray/api/home/details/belowTheFold?" + q).get("payload")
+    if btf is None:
+        raise RuntimeError(f"belowTheFold returned no payload for {url}")
+    groups = {}
+    for sg in (btf.get("amenitiesInfo") or {}).get("superGroups", []):
+        for g in sg.get("amenityGroups", []):
+            for e in g.get("amenityEntries", []):
+                vals = ", ".join(strip_tags(x) for x in e.get("amenityValues", []))
+                groups.setdefault(g.get("groupTitle") or "untitled", []).append(f'{e.get("amenityName") or e.get("referenceName")}: {vals}')
+    facts["mls_details"] = groups
     return facts
 
 d = listing_details(URL)
@@ -250,7 +267,7 @@ Observed output (trimmed):
  "url": "https://www.redfin.com/TX/Austin/3305-Tavistock-Dr-78748/home/32017342",
  "address": {"@type": "PostalAddress", "streetAddress": "3305 Tavistock Dr", "addressLocality": "Austin",
              "addressRegion": "TX", "postalCode": "78748", "addressCountry": "US"},
- "price": 599900, "availability": "InStock", "date_posted": "2026-10-23T14:21:33.012Z",
+ "price": 599900, "availability": "InStock", "date_posted": "2026-10-23T14:21:36.420Z",
  "home_type": "Single Family Residential", "beds": 3, "baths": 2.5, "sqft": 2190, "year_built": 2007,
  "lat": 30.1699391, "lon": -97.8444657,
  "amenities": ["Heating & cooling: Has A/C", "Parking: 2 car garage"],
@@ -270,7 +287,7 @@ Looping `listing_details()` over 8 Austin listings (condos, houses, one Coming S
 
 ### 3. Bulk search without a browser (plain Python)
 
-`/stingray/api/gis` answered plain urllib requests with 200 JSON (both with a full Chrome UA and with a bare `Mozilla/5.0`). Get `region_id` / `region_type` once from block 1, then page with this.
+`/stingray/api/gis` answered plain urllib requests with 200 JSON using a truthful `User-Agent: browser-harness-skill-example` (no browser UA needed). Python's default `Python-urllib/3.x` UA got 429. Get `region_id` / `region_type` once from block 1, then page with this.
 
 ```python
 import gzip, json, time, urllib.error, urllib.parse, urllib.request
@@ -279,37 +296,48 @@ import gzip, json, time, urllib.error, urllib.parse, urllib.request
 # 34098 / 2 is ZIP 78704 (Austin, TX); 30818 / 6 is the city of Austin.
 REGION_ID, REGION_TYPE = 34098, 2
 PAGE_SIZE, PAUSE = 100, 2.0
+MAX_PAGES = 50              # safety cap (raises if hit)
 
-UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
+# A truthful client name. Python's default "Python-urllib/3.x" UA got 429 here; this one got 200.
+UA = "browser-harness-skill-example"
 
-def gis(start):
+def gis(start, tries=3):
+    """One page of homes. Retries with backoff (5 s, 10 s), then raises instead of returning a short page."""
     q = {"al": 1, "ord": "redfin-recommended-asc", "sf": "1,2,3,5,6,7", "status": 9, "uipt": "1,2,3,4,5,6,7,8", "v": 8,
          "region_id": REGION_ID, "region_type": REGION_TYPE, "num_homes": PAGE_SIZE, "start": start}
     req = urllib.request.Request("https://www.redfin.com/stingray/api/gis?" + urllib.parse.urlencode(q),
                                  headers={"User-Agent": UA, "Accept": "application/json", "Accept-Encoding": "gzip"})
-    try:
-        with urllib.request.urlopen(req, timeout=60) as r:
-            body = r.read()
-            if r.headers.get("Content-Encoding") == "gzip":
-                body = gzip.decompress(body)
-    except urllib.error.HTTPError as e:
-        print("HTTP", e.code, "- use the browser block instead")
-        return []
-    text = body.decode("utf-8")
-    if not text.startswith("{}&&"):
-        print("unexpected body:", text[:120])
-        return []
-    return json.loads(text[4:])["payload"].get("homes", [])
+    for attempt in range(tries):
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                body = r.read()
+                if r.headers.get("Content-Encoding") == "gzip":
+                    body = gzip.decompress(body)
+            text = body.decode("utf-8")
+            if text.startswith("{}&&"):
+                d = json.loads(text[4:])
+                homes = (d.get("payload") or {}).get("homes")
+                if d.get("resultCode") == 0 and homes is not None:
+                    return homes
+            err = "unexpected body: " + text[:120]
+        except (urllib.error.URLError, TimeoutError) as e:      # HTTPError (403/429/5xx) is a URLError
+            err = repr(e)
+        print(f"gis start={start} try {attempt + 1}/{tries} failed: {err}")
+        if attempt + 1 < tries:
+            time.sleep(5 * 2 ** attempt)
+    raise RuntimeError(f"gis start={start} failed {tries} times; if it keeps failing use the browser block")
 
 homes, seen = [], set()
-for page in range(50):
+for page in range(MAX_PAGES):
     batch = gis(page * PAGE_SIZE)
     homes += [h for h in batch if h.get("propertyId") not in seen]
     seen.update(h.get("propertyId") for h in batch)
     print(f"page {page + 1}: {len(batch)} homes, {len(homes)} unique")
-    if len(batch) < PAGE_SIZE:
+    if len(batch) < PAGE_SIZE:          # a short successful page is the only end signal
         break
     time.sleep(PAUSE)
+else:
+    raise RuntimeError(f"hit MAX_PAGES={MAX_PAGES} with full pages; {len(homes)} homes so far. Raise MAX_PAGES and rerun.")
 
 v = lambda x: x.get("value") if isinstance(x, dict) else x
 for h in homes[:3]:
@@ -324,8 +352,8 @@ Observed output:
 page 1: 100 homes, 100 unique
 page 2: 100 homes, 200 unique
 page 3: 100 homes, 300 unique
-page 4: 31 homes, 331 unique
-2704 Little John Ln 78704 775000 3 2.0 1745 Active 30.2320405 -97.7502139 https://www.redfin.com/TX/Austin/2704-Little-John-Ln-78704/home/31631298
+page 4: 32 homes, 332 unique
+2706 Nottingham Ln 78704 735000 3 2.0 1443 Active 30.2324635 -97.7518632 https://www.redfin.com/TX/Austin/2706-Nottingham-Ln-78704/home/31697330
 1818 Margaret St 78704 2995000 3 4.0 2767 Coming Soon 30.2581798 -97.7689286 https://www.redfin.com/TX/Austin/1818-Margaret-St-78704/home/31205095
 ...
 ```
@@ -373,7 +401,7 @@ Detail page:
 
 - Do not `return fetch(...)` inside one `js()` call for big responses: a 350-home `gis` call usually finished in 1-4 s but once took longer, and `js()` raised `Runtime.evaluate timed out after 5s waiting for the daemon` mid-crawl. The `rf()` helper above starts the fetch, stores the text on `window`, and polls, which fixed it.
 - Every `/stingray` JSON response starts with `{}&&`. Strip 4 characters before `json.loads`; anything else in that position means you got an error page.
-- `page_number` does nothing: `page_number=2` returned the same first ids as page 1. Use `start=<offset>` (that is the parameter the site itself sends, as `start=0`). With `start` stepping by 350, Austin gave 5,795 unique ids with zero repeats.
+- `page_number` does nothing: `page_number=2` returned the same first ids as page 1. Use `start=<offset>` (that is the parameter the site itself sends, as `start=0`). With `start` stepping by 350, Austin gave 5,793 unique ids with zero repeats.
 - `num_homes` is the page size. 350 is what the site sends; 500 and 2,000 also returned that many in a single call, but big responses are slow and heavy, so keep 350 and page.
 - `status=9`, `status=1` and `status=130` returned the identical 331 homes for ZIP 78704 (Active, Coming Soon, New). Results were only for-sale/coming-soon; no Pending or Sold rows appeared. Do not rely on `status` to switch to sold homes.
 - Price filters: `min_price` / `max_price` alone were ignored (prices from 106,900 to 14,699,000 came back for a 500k-600k request). They were applied when sent together with the extra `market=austin&mpt=99` parameters the site's own filter URL produced. Simplest: fetch everything, then filter the rows in Python.

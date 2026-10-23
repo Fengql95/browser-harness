@@ -6,8 +6,8 @@ Field-tested against `scholar.google.com` on 2026-10-23 using a Browser Use clou
 
 - **Read this first:** `https://scholar.google.com/robots.txt` has `User-agent: *` / `Disallow: /scholar`, and Scholar can put a CAPTCHA wall (`google.com/sorry/`) in front of automated traffic. This skill is for a person-sized lookup (a few pages, tens of results). For bulk literature data use the `openalex` or `crossref` skills instead; they have real APIs.
 - **There is no JSON.** Results are server-rendered HTML: no JSON-LD, no `__NEXT_DATA__`, no `application/json` blocks were found in the page. You parse the HTML (or the DOM in a browser).
-- **Both paths worked, and both can be walled.** Plain `GET /scholar?q=...` with `User-Agent: Mozilla/5.0` returned 10 parsed results per page on every request (five 3-page runs, 20-40 s apart). In the browser, one cloud browser session was sent to `google.com/sorry/` on its very first request, homepage included; two later fresh cloud browsers loaded the homepage, search pages and `start=10,20` with no wall. Whether you get walled depends on the IP you come from, so check every page and stop on the first wall.
-- **10 results per page, `start=0,10,20,...`.** Seven 3-page runs (HTTP and browser) had between 0 and 4 repeated rows out of 30, so dedupe on the result id (`data-cid`).
+- **Both paths worked, and both can be walled.** Plain `GET /scholar?q=...` with `User-Agent: Mozilla/5.0` returned 10 parsed results per page on every request (six 3-page runs, 20-40 s apart). In the browser, one cloud browser session was sent to `google.com/sorry/` on its very first request, homepage included; three later fresh cloud browsers loaded the homepage, search pages and `start=10,20` with no wall. Whether you get walled depends on the IP you come from, so check every page and stop on the first wall.
+- **10 results per page, `start=0,10,20,...`.** Nine 3-page runs (HTTP and browser) had between 0 and 4 repeated rows out of 30, so dedupe on the result id (`data-cid`).
 - **When you hit the wall, stop.** Do not retry in a loop, rotate IPs or solve the CAPTCHA. Back off and switch to an API source.
 
 ## What works: paced HTTP search, 3 pages, stdlib only
@@ -138,8 +138,12 @@ def scholar_search(query, max_pages=3, year_from=None, delay=(20, 40)):
             print("STOP:", e)                            # do not retry or solve it; back off
             break
         total = total or res["total"]                    # only page 1 header parses
-        fresh = [r for r in res["rows"] if r["id"] not in seen]
-        seen.update(r["id"] for r in fresh)
+        fresh = []
+        for r in res["rows"]:
+            key = r["id"] or r["url"] or r["title"]      # fall back if a row has no data-cid
+            if key not in seen:                          # also drops repeats within one page
+                seen.add(key)
+                fresh.append(r)
         results.extend(fresh)
         pages.append({"start": page * 10, "rows": len(res["rows"]), "new": len(fresh), "has_next": res["has_next"]})
         if not res["rows"] or not res["has_next"]:
@@ -160,10 +164,10 @@ for r in rows[:3]:
 Real output (second row, `related_url` and `versions_url` trimmed; `authors` left out on purpose, it is a string of real names):
 
 ```text
-total: 13700 [{"start": 0, "rows": 10, "new": 10, "has_next": true}, {"start": 10, "rows": 10, "new": 10, "has_next": true}, {"start": 20, "rows": 10, "new": 10, "has_next": true}]
-30 unique rows
+total: 10100 [{"start": 0, "rows": 10, "new": 10, "has_next": true}, {"start": 10, "rows": 10, "new": 10, "has_next": true}, {"start": 20, "rows": 10, "new": 7, "has_next": true}]
+27 unique rows
 years: [2024, 2025, 2026]
-with cited_by>0: 30 with fulltext: 30
+with cited_by>0: 27 with fulltext: 27
 tags: []
 {"id": "3NERNDWIQgkJ", "tag": null, "title": "The Tool Illusion: Rethinking Tool Use in Web Agents", "url": "https://arxiv.org/abs/2604.03465", "venue_year": "arXiv preprint arXiv …, 2026", "year": 2026, "source": "arxiv.org", "snippet": "… tool use in web agents through an extensive and carefully controlled study across diverse tool sources, backbone models, tool-use … and inspires future research on tool-use web agents. …", "cited_by": 3, "cited_by_url": "https://scholar.google.com/scholar?cites=667245456892482012&as_sdt=2005&sciodt=0,5&hl=en", "fulltext_url": "https://arxiv.org/pdf/2604.03465", "fulltext_label": "[PDF] arxiv.org"}
 {"id": "jed5XCR57OkJ", "tag": null, "title": "Verltool: Towards holistic agentic reinforcement learning with tool use", "url": "https://arxiv.org/abs/2509.01055", "venue_year": "arXiv preprint arXiv …, 2025", "year": 2025, "source": "arxiv.org", "snippet": "… tool use with RLVR, giving rise to a new paradigm we term ARLT—Agentic Reinforcement Learning with Tool use. … We implement a Web Search tool using Google Search API through …", "cited_by": 105, "cited_by_url": "https://scholar.google.com/scholar?cites=16855980702418200461&as_sdt=2005&sciodt=0,5&hl=en", "fulltext_url": "https://arxiv.org/pdf/2509.01055?", "fulltext_label": "[PDF] arxiv.org"}
@@ -240,8 +244,12 @@ def scholar_search_browser(query, max_pages=3, year_from=None, delay=(20, 40)):
         for r in res.get("rows", []):
             m = re.search(r"\b(?:19|20)\d{2}\b", r["venue_year"] or "")
             r["year"] = int(m.group(0)) if m else None
-        fresh = [r for r in res.get("rows", []) if r["id"] not in seen]
-        seen.update(r["id"] for r in fresh)
+        fresh = []
+        for r in res.get("rows", []):
+            key = r["id"] or r["url"] or r["title"]      # fall back if a row has no data-cid
+            if key not in seen:                          # also drops repeats within one page
+                seen.add(key)
+                fresh.append(r)
         results.extend(fresh)
         pages.append({"start": page * 10, "rows": len(res.get("rows", [])), "new": len(fresh), "has_next": res.get("has_next")})
         if not res.get("rows") or not res.get("has_next"):
@@ -262,10 +270,10 @@ for r in rows[:2]:
 Real output from a fresh cloud browser (`related_url`/`versions_url` and second row trimmed, `authors` left out):
 
 ```text
-total: 6820 [{"start": 0, "rows": 10, "new": 10, "has_next": true}, {"start": 10, "rows": 10, "new": 8, "has_next": true}, {"start": 20, "rows": 10, "new": 10, "has_next": true}]
-28 unique rows
+total: 4150 [{"start": 0, "rows": 10, "new": 10, "has_next": true}, {"start": 10, "rows": 10, "new": 10, "has_next": true}, {"start": 20, "rows": 10, "new": 10, "has_next": true}]
+30 unique rows
 years: [2025, 2026]
-with cited_by>0: 27 with fulltext: 27
+with cited_by>0: 29 with fulltext: 29
 tags: []
 {"id": "SX73WcmwGNsJ", "tag": null, "title": "Walt: Web agents that learn tools", "url": "https://proceedings.iclr.cc/paper_files/paper/2026/hash/5b175f9e93873e3a10a6ce43dbb82e05-Abstract-Conference.html", "venue_year": "International …, 2026", "source": "proceedings.iclr.cc", "snippet": "… For the task “find the cheapest blue kayak,” traditional web agents execute a lengthy … vation space), also outperforms strong baselines based on test-time search and tool use by …", "cited_by": 20, "cited_by_url": "https://scholar.google.com/scholar?cites=15787562872591580745&as_sdt=2005&sciodt=0,5&hl=en", "fulltext_url": "https://proceedings.iclr.cc/paper_files/paper/2026/file/5b175f9e93873e3a10a6ce43dbb82e05-Paper-Conference.pdf", "fulltext_label": "[PDF] iclr.cc", "year": 2026}
 ```
@@ -274,7 +282,7 @@ tags: []
 
 | Field | Source in the result block | Notes |
 |---|---|---|
-| `id` | `data-cid` on `div.gs_r.gs_or.gs_scl` | Stable per paper cluster, use it to dedupe across pages |
+| `id` | `data-cid` on `div.gs_r.gs_or.gs_scl` | Stable per paper cluster, use it to dedupe across pages; the code dedupes on `url`, then `title`, for a row without it |
 | `tag` | `span.gs_ct1` inside `h3.gs_rt` | Seen: `[PDF]`, `[HTML]`, `[BOOK]`, `[PS]`; `None` for normal hits |
 | `title` | text of the `h3.gs_rt a` link | Every result seen in this run had the link; the code falls back to the bare `h3` text without it |
 | `url` | `h3.gs_rt a[href]` | Publisher or repository page; for `[PDF]` rows it is the PDF itself |
@@ -293,9 +301,9 @@ tags: []
 ## Gotchas
 
 - **robots.txt and the wall come first.** `/scholar` is disallowed for all user agents. Keep runs small, pace them (20-40 s between pages was used here), and stop on the first block. There is no official Scholar API.
-- **The wall depends on the IP.** One cloud browser session landed on `https://www.google.com/sorry/index?continue=https://scholar.google.com/...` with the text "Our systems have detected unusual traffic from your computer network" on its first request, including for the bare homepage. Two other fresh cloud browsers the same day were never walled. A browser is not a way around the wall; if you see it, stop and use an API source.
-- **Duplicates across pages.** 3-page runs returned 30 rows but 27, 29, 26, 30 and 27 unique ids over HTTP and 30 and 28 in the browser. Always dedupe on `id`.
-- **`total` only on page 1, and it is rough.** The HTTP regex returned `None` on pages 2 and 3, so the code keeps the first page's value. The same query reported 8,410, 8,970, 9,930, 13,700 and 15,600 (HTTP) and 4,300 and 6,820 (browser) results within an hour, and the first result differed between the HTTP and browser runs. Do not use it as a denominator.
+- **The wall depends on the IP.** One cloud browser session landed on `https://www.google.com/sorry/index?continue=https://scholar.google.com/...` with the text "Our systems have detected unusual traffic from your computer network" on its first request, including for the bare homepage. Three other fresh cloud browsers the same day were never walled. A browser is not a way around the wall; if you see it, stop and use an API source.
+- **Duplicates across pages.** 3-page runs returned 30 rows but 27, 29, 26, 30, 27 and 27 unique ids over HTTP and 30, 28 and 30 in the browser. Always dedupe on `id`, and keep a fallback key for any row without one.
+- **`total` only on page 1, and it is rough.** The HTTP regex returned `None` on pages 2 and 3, so the code keeps the first page's value. The same query reported 8,410, 8,970, 9,930, 10,100, 13,700 and 15,600 (HTTP) and 4,150, 4,300 and 6,820 (browser) results on the same day, and the first result differed between the HTTP and browser runs. Do not use it as a denominator.
 - **Truncated metadata.** Authors and venue are shortened with `…` by Scholar itself. Follow `url`, or look the title up in OpenAlex/Crossref, if you need full author lists, DOI or the full venue name.
 - **No consent banner** was served to plain HTTP or to the cloud browser (no "Before you continue" text). `hl=en` keeps the English link texts (`Cited by`, `All N versions`) that the parser matches on.
 - **Selector drift.** Both versions rely on Scholar's long-lived class names (`gs_r gs_or gs_scl`, `gs_rt`, `gs_ct1`, `gs_a`, `gs_rs`, `gs_or_cited`, `gs_or_ggsm`, `gs_ico_nav_next`). Result data has no ARIA labels, so classes are the only hook. If you get 0 rows on a page that is not walled, check those class names first.
@@ -303,6 +311,6 @@ tags: []
 
 ## What does not work
 
-- **Assuming you will not be walled.** One of three cloud browser sessions was redirected to the `google.com/sorry/` CAPTCHA on every navigation, homepage included. If that happens to you, stop. Do not solve or auto-solve it to keep scraping.
+- **Assuming you will not be walled.** One of four cloud browser sessions was redirected to the `google.com/sorry/` CAPTCHA on every navigation, homepage included. If that happens to you, stop. Do not solve or auto-solve it to keep scraping.
 - **Structured data.** No JSON-LD (0 `application/ld+json` scripts in the browser), embedded JSON, or public JSON endpoint for search results.
 - **Bulk crawling.** Deep pagination, many queries in a row, or crawling `cited_by_url` / `versions_url` for every row was not attempted, because `/scholar` is disallowed in robots.txt and the wall can trigger on low volume from some networks. Use the `openalex` or `crossref` skills for anything bigger than a handful of pages.

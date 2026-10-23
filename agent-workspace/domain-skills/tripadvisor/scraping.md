@@ -1,6 +1,6 @@
 # Tripadvisor — Scraping hotels and restaurants for a city
 
-Field-tested against www.tripadvisor.com on 2026-10-23 using a Browser Use cloud browser (plain HTTP was also tried and is blocked).
+Field-tested against www.tripadvisor.com on 2026-10-23 using a Browser Use cloud browser (plain HTTP was also tried and is blocked); every code block re-run verbatim in a fresh cloud browser the same day.
 
 ## Quick summary
 
@@ -202,20 +202,25 @@ def open_page(url, first=False):
 SEE_ALL_JS = """[...document.querySelectorAll('button')].find(b => /^See all [\\d,]+ hotels/.test(b.innerText.trim()))"""
 
 def expand_first_page():
-    """Page 1 renders only 5 ranked hotels until 'See all N hotels' is clicked."""
-    if ranked_count() >= PER_PAGE:
+    """Page 1 renders only 5 ranked hotels until 'See all N hotels' is clicked. Raises instead of scraping 5."""
+    m = re.search(r"([\d,]+) properties in ", js("document.body.innerText") or "")
+    if not m:
+        raise RuntimeError("'N properties in City' total not found on page 1")
+    want = min(PER_PAGE, int(m.group(1).replace(",", "")))   # small cities have fewer than 30
+    if ranked_count() >= want:
         return
     if not js(f"(() => {{ const b = {SEE_ALL_JS}; if (!b) return false; b.scrollIntoView({{block: 'center'}}); return true; }})()"):
-        return
+        raise RuntimeError(f"'See all N hotels' button not found; page 1 has {ranked_count()} of {want} ranked hotels")
     time.sleep(1.5)
     press_key("Escape")          # scrolling can pop the sticky date picker over the button
     time.sleep(1)
     xy = js(f"(() => {{ const r = ({SEE_ALL_JS}).getBoundingClientRect(); return [r.x + r.width / 2, r.y + r.height / 2]; }})()")
     click_at_xy(*xy)
     for _ in range(20):
-        if ranked_count() >= PER_PAGE:
-            break
+        if ranked_count() >= want:
+            return
         time.sleep(0.5)
+    raise RuntimeError(f"'See all' click did not expand page 1: {ranked_count()} of {want} ranked hotels after 10 s")
 
 def ld_itemlist():
     for s in js("[...document.querySelectorAll('script[type=\"application/ld+json\"]')].map(s => s.textContent)") or []:
@@ -303,7 +308,7 @@ page 2: https://www.tripadvisor.com/Hotels-g60745-oa30-Boston_Massachusetts-Hote
   "location_id": "15618152"
  }, ...
 ]
-[(58, 'HI Boston - Hostel', '$203'), (59, 'Ramada by Wyndham Boston', '$91'), (60, 'Residence Inn by Marriott Boston Back Bay/Fenway', '$270')]
+[(58, 'Hyatt Regency Boston', '$237'), (59, 'Boston Harbor Hotel', '$502'), (60, 'Boston Marriott Long Wharf', '$234')]
 ranks contiguous: True
 rows joined to JSON-LD: 60
 rows with a price: 60
@@ -357,6 +362,7 @@ def detail(url, first=False):
         "amenities": [a["name"] for a in j.get("amenityFeatures") or [] if a.get("value")][:10],
         "opening_hours": [(h.get("dayOfWeek"), h.get("opens"), h.get("closes")) for h in j.get("openingHoursSpecification") or []],
         "url": j.get("url") or url,
+        "location_id": (re.search(r"-d(\d+)-", url) or [None, None])[1],
     }
 
 for i, u in enumerate(URLS):
@@ -380,6 +386,7 @@ Real output (trimmed):
  "geo": [42.343216, -71.05699],
  "amenities": ["Valet parking", "Free High Speed Internet (WiFi)", "Fitness Center with Gym / Workout Room", ...],
  ...
+ "location_id": "15618152"
 }
 {
  "type": "FoodEstablishment",
@@ -391,6 +398,7 @@ Real output (trimmed):
  "cuisine": "French, Cafe",
  "opening_hours": [["Sunday", "07:00:00", "15:00:00"], ...],
  ...
+ "location_id": "19799010"
 }
 ```
 
@@ -407,17 +415,19 @@ Real output (trimmed):
 | `price_from` | hotel list | card text after `from` (default dates, USD) | `"$165"` |
 | `price_tier` | hotel list | ItemList JSON-LD `priceRange` | `"€"`, `"€€"` |
 | `cuisine` | restaurant list, detail | JSON-LD `servesCuisine` (string in list, array on detail) | `"French, Cafe"` |
-| `address`, `telephone`, `geo` | lists, detail | JSON-LD `address`, `telephone`, `geo` | `"55 Temple Place, Boston, MA 02111"` |
+| `address` | lists, detail | JSON-LD `address` | `"55 Temple Place, Boston, MA 02111"` |
+| `telephone` | restaurant list, detail | JSON-LD `telephone` | `"+1 617-779-0062"` |
+| `geo` | detail | JSON-LD `geo` (also in the list ItemList, not extracted above) | `[42.343216, -71.05699]` |
 | `popularity_rank` | detail | page text `#N of M ... in City` | `"#68 of 96 hotels in Boston"` |
 | `hotel_class` | hotel detail | page text `N of 5 stars` | `4.0` |
 | `amenities` | hotel detail | JSON-LD `amenityFeatures[].name` | `"Valet parking"` |
-| `opening_hours` | restaurant list, detail | JSON-LD `openingHoursSpecification` | `("Sunday", "07:00:00", "15:00:00")` |
-| `location_id` | all | `-d<id>-` in the URL, stable join key | `"19799010"` |
+| `opening_hours` | restaurant detail | JSON-LD `openingHoursSpecification` | `("Sunday", "07:00:00", "15:00:00")` |
+| `location_id` | lists, detail | `-d<id>-` in the URL, stable join key | `"19799010"` |
 | total results | restaurant list | `[data-automation="resultsTotal"]` | `"2,561 results"` |
 
 ## Gotchas
 
-- **Hotels page 1 shows only 5 ranked hotels.** The 30-item list appears only after clicking "See all N hotels" (URL does not change; ItemList JSON-LD grows from 8 to 30). Scrolling that button into view opened the sticky check-in date picker on top of it in this run, and a blind click picked a date instead. Press Escape, then click.
+- **Hotels page 1 shows only 5 ranked hotels.** The 30-item list appears only after clicking "See all N hotels" (URL does not change; ItemList JSON-LD grows from 8 to 30). Scrolling that button into view opened the sticky check-in date picker on top of it in this run, and a blind click picked a date instead. Press Escape, then click. `expand_first_page()` raises if the button is missing or the list does not grow, so a failed click never yields a silent 5-row page. Its target is `min(30, "N properties in City")`: Lisbon, Ohio shows `6 properties in Lisbon` with all 6 ranked and a "See all 34 hotels" button (nearby towns), so small cities need no click.
 - **Pages 2+ need no click.** `-oa30-`, `-oa60-` load 30 ranked hotels directly. `-oa0-` and `-oa5-` redirect to page 1 (the 5-hotel view).
 - **JSON-LD `position` restarts at 1 on every page.** Take the global rank from the card title (`"31. The Bostonian Hotel Boston"`), not from `position`.
 - **Sponsored cards** have no `"N."` prefix (hotels: a `Sponsored` label; the same sponsored hotel appeared twice on one page). Sponsored hotel links are absolute and carry `?spAttributionToken=`. Skip them and dedupe by `location_id`.

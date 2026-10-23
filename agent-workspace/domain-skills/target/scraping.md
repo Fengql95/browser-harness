@@ -6,7 +6,7 @@ Field-tested against www.target.com on 2026-10-23 using a Browser Use cloud brow
 
 - **Search results** are not in the HTML. The grid is filled client-side by `GET https://cdui-orchestrations.target.com/cdui_orchestrations/v1/pages/slp?...`. Calling that endpoint from plain Python returned **HTTP 435** with a PerimeterX block payload. From inside a loaded search page, `fetch()` of the same URL returned **200** with clean JSON (title, price, rating, rating count, TCIN, URL, shipping/pickup status). Paginate by changing `offset` (24 per page).
 - **Product details** (`/p/-/A-<TCIN>`): plain HTTP GET returned **200** with `__NEXT_DATA__` holding the full product record (title, brand, DPCI, UPC, breadcrumbs, rating distribution, review/question counts, bullets, description, images). Price and fulfillment are **not** in that HTML (deferred modules).
-- **Live price + fulfillment on a product page**: open it in the browser, bring the tab to the front, read two `data-test` modules.
+- **Live price + fulfillment on a product page**: open it in the browser, read two `data-test` modules. They only render while the tab is visible; bringing a hidden tab to the front is an explicit opt-in (`ALLOW_FOREGROUND` in block 3).
 - No JSON-LD product data on either page type (search has only a `WebPage` breadcrumb block, product pages had none).
 - **A fresh browser can be blocked on its very first search.** In 1 of 3 fresh browser sessions on 2026-10-23 PerimeterX answered the page's own slp calls with 435 before any extra request, and the page read "We couldn't find a match for your search." Block 1 detects this and stops; a new browser session (new exit IP) worked.
 
@@ -68,7 +68,7 @@ def fetch_search(offset):
 def parse(p):
     item = p.get("item") or {}
     parent = p.get("parent") or {}
-    price = p.get("price") or {}
+    price = p.get("price") or parent.get("price") or {}   # parent.price has only the formatted strings
     stats = (p.get("ratings_and_reviews") or parent.get("ratings_and_reviews") or {}).get("statistics") or {}
     rating = stats.get("rating") or {}
     ful = p.get("fulfillment") or {}
@@ -147,6 +147,7 @@ For "air fryer" each page returned 30 products: 24 organic plus 6 sponsored slot
 import html, json, re
 
 TCIN = "89110863"   # from the search rows above, or the A-<digits> part of any /p/ URL
+TCIN = TCIN.strip().removeprefix("A-")   # accept "A-89110863" too
 
 page = http_get(f"https://www.target.com/p/-/A-{TCIN}", headers={
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
@@ -188,7 +189,7 @@ detail = {
     "description": html.unescape(re.sub("<[^>]+>", " ", desc.get("downstream_description") or "")).strip(),
     "package_dimensions": item.get("package_dimensions"),
     "primary_image": (images.get("primary_image") or {}).get("url"),
-    "image_count": 1 + len(images.get("alternate_images") or []),
+    "image_count": int(bool((images.get("primary_image") or {}).get("url"))) + len(images.get("alternate_images") or []),
 }
 print(json.dumps(detail, indent=1)[:2500])
 ```
@@ -221,18 +222,17 @@ The same request from plain Python `urllib` (desktop Chrome UA) also returned 20
 ```python
 import json, time
 
-TCIN = "89110863"
+TCIN = "89110863".strip().removeprefix("A-")
+ALLOW_FOREGROUND = False   # opt-in: True lets this block bring the tab to the front (visible tab switch)
 
 tab = new_tab(f"https://www.target.com/p/-/A-{TCIN}")
 wait_for_load()
-# The price module stays a grey placeholder while the tab is hidden
-# (document.visibilityState == "hidden"), so bring this tab to the front.
-activate_tab(current_tab())
 
 # Price and fulfillment are deferred modules, filled after load by
 # www.target.com/cdui_orchestrations/v1/pages/pdp/deferred_enrichment/modules
+# They stay a grey placeholder while the tab is hidden (document.visibilityState == "hidden").
 live = {}
-for _ in range(20):
+for i in range(20):
     live = js("""(() => {
       const t = s => (document.querySelector(s)?.innerText || '').trim();
       return {
@@ -245,7 +245,16 @@ for _ in range(20):
     })()""")
     if live["price_block"] and live["fulfillment"]:
         break
+    if i == 5 and live["visibility"] == "hidden":
+        if not ALLOW_FOREGROUND:
+            close_tab(tab)
+            raise SystemExit("tab is hidden and the price module did not render; "
+                             "set ALLOW_FOREGROUND = True to bring it to the front")
+        activate_tab(current_tab())
     time.sleep(1)
+else:
+    close_tab(tab)
+    raise SystemExit(f"price/fulfillment modules did not render in 20 s: {json.dumps(live)}")
 print(json.dumps(live, indent=1))
 close_tab(tab)
 ```
@@ -296,7 +305,7 @@ Product page (`ProductDetailWebDatasourceCore.module_data.data.product`, block 2
 - **Sponsored duplicates.** With `count=24`, "air fryer" pages returned 30 products; the 6 extras were sponsored repeats of organic TCINs. Product counts per page vary (27 and 24 for "lego"), and organic TCINs sometimes repeat on the next page, so dedupe by TCIN and loop until `metadata.total_pages` or an empty page, not on a fixed size. `total_pages` itself drifted (12 vs 11) between calls for the same query.
 - **Variation items.** Items with a `parent` (colors/sizes) had no product-level `ratings_and_reviews`; read it from `parent`.
 - **Query rewriting.** "lego" came back with `facets: "d_brand_all:lego"` (brand facet applied). A nonsense query (`zzqqxxnonexistent123`) still returned a 9-page grid, so check `metadata.keyword` and relevance before trusting results.
-- **Hidden tabs do not render the PDP price.** In a background tab the price module stayed a placeholder (`data-test="price-module-placeholder"`) and `visibilityState` was `hidden`; `activate_tab(current_tab())` fixed it.
+- **Hidden tabs do not render the PDP price.** In a background tab the price module stayed a placeholder (`data-test="price-module-placeholder"`) and `visibilityState` was `hidden`; `activate_tab(current_tab())` fixed it. Block 3 does that only with `ALLOW_FOREGROUND = True` because it visibly switches tabs; otherwise it stops with a message. In a cloud browser with only this tab open, the new tab was already `visible` and rendered the price without it.
 - **First-load PerimeterX block.** A block can happen on the first search load of a fresh browser, with no earlier requests. Signs: `performance.getEntriesByType('resource')` shows the slp entries with `responseStatus` 435, refetching the same URL also returns 435 (`<meta name="description" content="px-captcha">`), there are 0 `[data-test="ListingPageProductListing"]` cards, and the page says "We couldn't find a match for your search." That text is not a real empty result. Starting a new browser session with a different exit IP worked. Do not try to solve the captcha.
 - **Browser fetch volume.** A full slp response is about 850 KB of JSON. In unblocked sessions, about 20 slp requests (page loads plus in-page fetches at 2 s spacing) produced no 429 and no new block; heavier rates were not tested, so keep the pacing.
 - **Tabs.** Blocks 1 and 3 each open a tab with `new_tab()` and close it with `close_tab(tab)` at the end. Closing the last tab left the cloud browser with 0 tabs, and the next `new_tab()` still worked.

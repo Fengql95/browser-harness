@@ -17,7 +17,7 @@ Field-tested against www.yelp.com on 2026-10-23 using a Browser Use cloud browse
 
 ```python
 import json, html, time
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 
 def yelp_search_url(term, location, start=0):
     q = {"find_desc": term, "find_loc": location}
@@ -25,23 +25,33 @@ def yelp_search_url(term, location, start=0):
         q["start"] = start
     return "https://www.yelp.com/search?" + urlencode(q)
 
+READY_JS = """(() => !window.__yelpStale
+  && !!document.querySelector('script[data-apollo-state]')
+  && (!%s || !!document.querySelector('script[data-hypernova-key*="GondolaSearch"]')))()"""
+
 def open_yelp(url, first=False, tries=3):
-    """Navigate and wait until Yelp's server-rendered JSON is present. Retries
-    chrome-error pages, pages without the JSON, and CDP timeouts (all seen in testing)."""
+    """Navigate and wait until this navigation's server-rendered JSON is present (Apollo,
+    plus hypernova for /search). The old document is marked first, so it can never pass
+    as the new page. Retries chrome-error pages, pages without the JSON, and CDP timeouts
+    (all seen in testing); raises if the page never loads."""
+    is_search = urlparse(url).path.startswith("/search")
     for i in range(tries):
         try:
             if first and i == 0:
                 new_tab(url)
             else:
+                try:
+                    js("window.__yelpStale = true")
+                except Exception:
+                    pass
                 goto_url(url)
             wait_for_load()
-            ok = js("!!document.querySelector('script[data-apollo-state]')")
-            if ok and not page_info()["url"].startswith("chrome-error"):
-                return True
+            if js(READY_JS % ("true" if is_search else "false")):
+                return
         except Exception as e:  # e.g. "Page.navigate timed out", "Runtime.evaluate timed out"
             print(f"load attempt {i + 1} failed: {type(e).__name__}: {e}")
         time.sleep(5 * (i + 1))
-    return False
+    raise RuntimeError(f"Yelp page did not load after {tries} tries: {url}")
 
 def _strip(s):
     return s.strip().removeprefix("<!--").removesuffix("-->")
@@ -89,10 +99,8 @@ def read_search_page():
 
 term, location, max_pages = "pizza", "San Francisco, CA", 3
 results = []
-for page in range(max_pages):
-    if not open_yelp(yelp_search_url(term, location, start=page * 10), first=(page == 0)):
-        print("page did not load, stopping at page", page + 1)
-        break
+for page in range(max_pages):  # max_pages is the explicit cap; Yelp's own cap is 240 results
+    open_yelp(yelp_search_url(term, location, start=page * 10), first=(page == 0))  # raises on failure
     rows, total, per_page, start = read_search_page()
     print(f"page {page + 1}: start={start} organic={len(rows)} total={total}")
     if not rows:
@@ -129,30 +137,35 @@ import json, html, time
 from urllib.parse import urlparse, unquote
 
 def open_yelp(url, first=False, tries=3):
+    """Same as block 1, for /biz/ pages: mark the old document, navigate, wait for Apollo."""
     for i in range(tries):
         try:
             if first and i == 0:
                 new_tab(url)
             else:
+                try:
+                    js("window.__yelpStale = true")
+                except Exception:
+                    pass
                 goto_url(url)
             wait_for_load()
-            ok = js("!!document.querySelector('script[data-apollo-state]')")
-            if ok and not page_info()["url"].startswith("chrome-error"):
-                return True
+            if js("!window.__yelpStale && !!document.querySelector('script[data-apollo-state]')"):
+                return
         except Exception as e:
             print(f"load attempt {i + 1} failed: {type(e).__name__}: {e}")
         time.sleep(5 * (i + 1))
-    return False
+    raise RuntimeError(f"Yelp page did not load after {tries} tries: {url}")
 
 def read_biz_page():
-    """Parse the open /biz/<alias> page from its Apollo cache."""
+    """Parse the open /biz/<alias> page from its Apollo cache. Returns None when no
+    Business entry matches the page's alias (the cache also holds other businesses)."""
     raw = js("(() => { const a = document.querySelector('script[data-apollo-state]'); return a ? a.textContent : null })()")
     if not raw:
         return None
     apollo = json.loads(html.unescape(raw.strip().removeprefix("<!--").removesuffix("-->")))
     alias = unquote(urlparse(page_info()["url"]).path.split("/biz/")[-1].strip("/"))
     bizs = [v for k, v in apollo.items() if k.startswith("Business:")]
-    b = next((v for v in bizs if v.get("alias") == alias), None) or next((v for v in bizs if "phoneNumber" in v), None)
+    b = next((v for v in bizs if v.get("alias") == alias), None)
     if not b:
         return None
     loc = apollo.get((b.get("location") or {}).get("__ref", ""), {}) or {}
@@ -181,10 +194,11 @@ urls = [
     "https://www.yelp.com/biz/outta-sight-pizza-san-francisco",
 ]
 for i, u in enumerate(urls):
-    if not open_yelp(u, first=(i == 0)):
-        print("failed to load", u)
-        continue
-    print(json.dumps(read_biz_page(), ensure_ascii=False))
+    open_yelp(u, first=(i == 0))  # raises on failure
+    row = read_biz_page()
+    if row is None:
+        raise RuntimeError(f"no Business entry for the alias of {page_info()['url']}")
+    print(json.dumps(row, ensure_ascii=False))
     time.sleep(3)
 ```
 
@@ -220,12 +234,13 @@ Feed it the `url` values from block 1 to enrich search rows with phone and full 
 - **`ranking` is not reliable.** It was set (1..10) for the pizza search but `None` for every organic row in the plumbers search, so the code above computes rank from `startResult`.
 - **240-result cap.** `totalResults` reported 240 for both test searches. `start=240` returns a "results unavailable" page whose hypernova props only contain `searchExceptionProps`. Narrow the query (neighborhood, category, filters) to get more distinct businesses.
 - **JSON-LD varies between browser sessions; do not depend on it.** In one cloud session, 4 of 4 search loads had a `SearchResultsPage` JSON-LD (an `ItemList` of the first 10 businesses only) plus `Product`, `BreadcrumbList` and sometimes `WebSite`/`FAQPage`, and 4 of 4 business loads had a `Restaurant` JSON-LD with `telephone`. In a second session the same day, 4 of 4 search loads had only `BreadcrumbList`/`FAQPage` and 2 of 2 business loads had only `ItemList` x2 + `BreadcrumbList`, no `Restaurant`. The Apollo cache was present on every successful load in both sessions.
-- **Transient load failures.** Seen in testing: a business page landing on `chrome-error://chromewebdata/` ("This site can't be reached"), a search load whose page had no Apollo/hypernova JSON yet, and CDP timeouts (`Page.navigate timed out`, `Runtime.evaluate timed out`). Each loaded fine on retry. `open_yelp` catches these and retries with backoff.
+- **Transient load failures.** Seen in testing: a business page landing on `chrome-error://chromewebdata/` ("This site can't be reached"), a search load whose page had no Apollo/hypernova JSON yet, and CDP timeouts (`Page.navigate timed out`, `Runtime.evaluate timed out`). Each loaded fine on retry. `open_yelp` catches these, retries with backoff, and raises after 3 failed tries instead of returning partial results. Because a timed-out navigation can leave the previous Yelp page in place, `open_yelp` sets a `window.__yelpStale` flag on the old document before navigating and only accepts a document without it.
+- **A business page's Apollo cache holds other businesses too** (e.g. 3 `Business:` entries on one page, only 1 with a phone). `read_biz_page` matches on the URL alias and returns `None` on a miss rather than guessing.
 - **No consent banner** appeared for US searches from the cloud browser. No login wall on search or business pages.
 - **Pacing.** About 20 browser page loads in one session, spaced 3+ seconds apart, produced no CAPTCHA or block. Keep a few seconds between pages and avoid parallel tabs on Yelp.
 
 ## What does not work
 
-- `http_get` (plain HTTP, even with a full Chrome User-Agent and Accept headers) returned **HTTP 403** for both `/search?...` and `/biz/<alias>` URLs.
+- Plain HTTP returned **HTTP 403** for both `/search?...` and `/biz/<alias>` URLs with the default Python User-Agent, a truthful `browser-harness-skill-example` one, and a full Chrome one (re-checked 2026-10-23).
 - Paginating past `start=230` (see cap above).
 - Phone numbers for organic results from the search page alone; one business page load per business is needed.
