@@ -1,0 +1,396 @@
+# Best Buy — Product Search, Prices, Availability & Specs
+
+Field-tested against www.bestbuy.com on 2026-10-23 using a Browser Use cloud browser (plain HTTP was tried too and does not work, see below).
+
+## Quick summary
+
+- **Plain HTTP is a dead end.** `curl` and `http_get` to `www.bestbuy.com` never got a response: curl's default HTTP/2 request failed with a stream error (exit 92); HTTP/1.1 and `http_get` hit a 20 s read timeout with zero bytes, with both a bare `Mozilla/5.0` UA and a full Chrome UA. The official `api.bestbuy.com` returns `403 {"errorMessage":"We were unable to locate your API Key."}` without a key; if you can register a key at developer.bestbuy.com, that API is the stable source (see "What does not work").
+- **Use a real browser.** Search results (`/site/searchpage.jsp?st=<query>&cp=<page>`) and product pages render normally in a cloud browser, logged out, no CAPTCHA seen.
+- **Search results are client-rendered and lazy.** Cards get prices only after they scroll into view, so scroll the page, then read the DOM cards (`.product-list-item[data-product-id]`). 20-24 cards per page, sponsored cards included.
+- **Product pages carry JSON-LD `Product`** (SKU, model, brand, price, availability, rating, review count, open-box offers). Full specs sit behind the "See all specifications" button; click it and read the sheet.
+- **The tab must be visible.** A background tab stayed on "Loading..." skeletons; `activate_tab(current_tab())` fixed it.
+
+---
+
+## What works: search results across pages
+
+Title, SKU, price, sale price, rating, review count, availability and URL for 3 result pages of `gaming laptop`. Self-contained; opens one new tab.
+
+```python
+import json, time
+from urllib.parse import quote_plus
+
+EXTRACT_CARDS = r"""(() => {
+  const money = s => { const m = (s || '').match(/\$([\d,]+\.\d{2})/); return m ? parseFloat(m[1].replace(/,/g, '')) : null; };
+  const txt = (el, sel) => { const e = el.querySelector(sel); return e ? e.innerText.trim() : null; };
+  return [...document.querySelectorAll('.product-list-item[data-product-id]')].map(card => {
+    const h3 = card.querySelector('h3');
+    const link = h3 ? h3.closest('a') : null;
+    const rnr = txt(card, '[data-testid="rnr-stats-link"] p') || '';
+    const rm = rnr.match(/rating,? ([\d.]+) out of 5 stars with ([\d,]+) review/i);
+    const price = money(txt(card, '[data-testid="price-block-customer-price"]'));
+    const regular = money(txt(card, '[data-testid="price-block-regular-price"]'));
+    // plp-add-to-cart-<sku>-label, plp-sold-out-<sku>-label, plp-unavailable-<sku>-label, plp_openbox-unavailable-<sku>-label
+    const btn = card.querySelector('[data-testid^="plp"][data-testid$="-label"]');
+    const button = btn ? btn.innerText.trim() : null;
+    const status = button === 'Add to cart' ? 'in_stock' : button === 'Sold Out' ? 'sold_out'
+      : button === 'Unavailable' ? 'unavailable' : /High demand product/.test(card.innerText) ? 'high_demand'
+      : button ? button.toLowerCase() : null;
+    return {
+      sku: card.getAttribute('data-product-id'),
+      title: h3 ? (h3.getAttribute('title') || h3.innerText).trim() : null,
+      url: link ? link.href.split('?')[0] : null,
+      price,                       // what the customer pays now
+      regular_price: regular,      // "Comp. Value", only shown when discounted
+      on_sale: regular !== null && price !== null && price < regular,
+      savings: txt(card, '[data-testid="price-block-total-savings-text"]'),
+      rating: rm ? parseFloat(rm[1]) : null,
+      review_count: rm ? parseInt(rm[2].replace(/,/g, ''), 10) : (/Not yet reviewed/i.test(card.innerText) ? 0 : null),
+      availability: status,
+      button,
+      pickup: txt(card, '[data-testid^="plp-pickup-messaging-"]'),
+      shipping: txt(card, '[data-testid^="plp-shipping-messaging-"]'),
+      sponsored: !!card.closest('li.slContainer'),
+    };
+  });
+})()"""
+
+def safe_js(expr, tries=6):
+    # The page's main thread is busy for a few seconds after navigation and
+    # Runtime.evaluate can time out; retry instead of failing.
+    for _ in range(tries):
+        try:
+            return js(expr)
+        except (RuntimeError, TimeoutError):
+            wait(2)
+    return None
+
+def nav(url):
+    # Best Buy keeps the main thread busy; give Page.navigate more than the 5 s default
+    cdp("Page.navigate", url=url, _response_timeout=30)
+
+def load_search_page(query, page=1):
+    nav(f"https://www.bestbuy.com/site/searchpage.jsp?st={quote_plus(query)}&cp={page}")
+    for _ in range(20):  # wait until product titles have rendered
+        wait(1.5)
+        if (safe_js("document.querySelectorAll('.product-list-item h3').length") or 0) > 0:
+            break
+        if safe_js("document.body.innerText.includes('unable to display products')"):
+            return [], None  # past the last page (or a transient error page)
+    # Cards and price blocks render lazily when they scroll into view.
+    for _ in range(25):
+        safe_js("window.scrollBy(0, 800)")
+        wait(0.6)
+        if safe_js("window.innerHeight + window.scrollY >= document.body.scrollHeight - 50"):
+            break
+    for _ in range(3):  # revisit cards whose title or price block has not rendered yet
+        missing = safe_js("""[...document.querySelectorAll('.product-list-item[data-product-id]')]
+            .filter(c => !c.querySelector('h3') || !c.querySelector('[data-testid="price-block-customer-price"]'))
+            .map(c => c.getAttribute('data-product-id'))""") or []
+        if not missing:
+            break
+        for sku in missing:
+            safe_js(f"document.querySelector('.product-list-item[data-product-id=\"{sku}\"]')?.scrollIntoView({{block: 'center'}})")
+            wait(0.8)
+        wait(1.5)
+    cards = safe_js(EXTRACT_CARDS) or []
+    total = safe_js("((window._BBY_DATA_ || {}).listResult || {}).count || (window.dioPageData || {}).searchResultsNum || null")
+    return cards, total
+
+new_tab("about:blank")
+activate_tab(current_tab())  # a hidden (background) tab stays on "Loading..." skeletons
+
+query = "gaming laptop"
+all_items, seen = [], set()
+for page in range(1, 4):  # raise the cap for a full crawl
+    cards, total = load_search_page(query, page)
+    if not cards:
+        break
+    new = 0
+    for c in cards:  # the same SKU can show up as a sponsored and an organic card
+        if c["sku"] and c["sku"] not in seen:
+            seen.add(c["sku"])
+            c["page"] = page
+            all_items.append(c)
+            new += 1
+    print(f"page {page}: {len(cards)} cards, {new} new, {sum(c['price'] is not None for c in cards)} priced, total results {total}")
+    time.sleep(3)  # polite pacing between result pages
+
+from collections import Counter
+print(len(all_items), "unique products;", Counter(c["availability"] for c in all_items))
+for item in all_items[:3]:
+    print(json.dumps(item))
+```
+
+Real output (trimmed, 2026-10-23):
+
+```
+page 1: 24 cards, 19 new, 20 priced, total results 1233
+page 2: 24 cards, 21 new, 24 priced, total results 1233
+page 3: 24 cards, 20 new, 24 priced, total results 1233
+60 unique products; Counter({'in_stock': 51, 'unavailable': 5, None: 2, 'shop open-box': 2})
+{"sku": "6674559", "title": "Alienware - 15.3\" 2K Gaming Laptop - AMD Ryzen 200 Series R7 260 2026 - 16GB Memory - NVIDIA GeForce RTX 5050 8GB - 1TB Storage - Black",
+ "url": "https://www.bestbuy.com/product/alienware-15-3-2k-gaming-laptop-amd-ryzen-200-series-r7-260-2026-16gb-memory-nvidia-geforce-rtx-5050-8gb-1tb-storage-black/J3K4L6QR6V",
+ "price": 1174.99, "regular_price": 1924.99, "on_sale": true, "savings": "Save $750", "rating": 4.6, "review_count": 38,
+ "availability": "in_stock", "button": "Add to cart", "pickup": "Pick up Thu, Oct 29", "shipping": "Get it tomorrow • FREE",
+ "sponsored": false, "page": 1}
+```
+
+Counts vary run to run: a second run of the same block minutes later gave 24/24 priced on every page and 60 products all `in_stock`. "Unavailable" and "Sold Out" cards still carry a price once they scroll into view: on an `rtx 5090` search, all 6 "Unavailable" cards on pages 1, 2, 3 and 6 had a price (e.g. $1,799.99, $799.99). `price` is `null` only when a card never rendered its price block, which happened to 1 of 16 cards on page 6 (it also had no button).
+
+### Search result fields
+
+| Field | Source on the card | Notes |
+|---|---|---|
+| `sku` | `data-product-id` attribute | Best Buy SKU, e.g. `6674559` |
+| `title` | `h3[title]` | Brand, " - ", name |
+| `url` | `href` of the link wrapping the `h3` | `/product/<slug>/<code>`; sponsored cards append `/sku/<sku>` |
+| `price` | `[data-testid="price-block-customer-price"]` | Current price, float |
+| `regular_price` | `[data-testid="price-block-regular-price"]` ("Comp. Value: $1,924.99") | Only shown when discounted |
+| `on_sale` | `price < regular_price` | |
+| `savings` | `[data-testid="price-block-total-savings-text"]` | e.g. `Save $750` |
+| `rating`, `review_count` | `[data-testid="rnr-stats-link"] p` ("Rating 4.6 out of 5 stars with 38 reviews") | Some items say "Syndicated rating, 4.76 out of 5 stars with 59 reviews on <vendor site>"; the regex takes both. "Not yet reviewed" gives `0` |
+| `button`, `availability` | `[data-testid^="plp"][data-testid$="-label"]` | Seen: "Add to cart" (`plp-add-to-cart-<sku>-label`), "Sold Out" (`plp-sold-out-…`), "Unavailable" (`plp-unavailable-…`, `plp_openbox-unavailable-…`), "Shop Open-Box". Collectibles marked "High demand product" have no such button (`high_demand`). `null` when no button rendered |
+| `pickup`, `shipping` | `[data-testid^="plp-pickup-messaging-"]`, `[data-testid^="plp-shipping-messaging-"]` | e.g. "Pick up in 1 hour", "Get it tomorrow • FREE", "Unavailable"; depends on the store Best Buy assigns to your IP |
+| `sponsored` | card is inside `li.slContainer` | Dedupe on `sku` |
+
+Page level: total result count is `window._BBY_DATA_.listResult.count` (sometimes an empty object), fallback `window.dioPageData.searchResultsNum`. `window._BBY_DATA_.skus` lists the page's SKUs in rank order with `isSponsored` flags before the cards finish rendering.
+
+---
+
+## What works: product page with full specs
+
+Price, regular price, availability, rating, open-box offers and every spec row. Reuses the current tab, takes the organic SKUs from a live `laptop` search, and scrapes product pages until it has shown one discounted and one full-price product (about 30-50 s per product). Call `get_product(sku)` with any SKU from the search block.
+
+```python
+import json
+
+PRODUCT_LD = r"""(() => {
+  for (const s of document.querySelectorAll('script[type="application/ld+json"]')) {
+    try { const d = JSON.parse(s.textContent); if (d['@type'] === 'Product') return d; } catch (e) {}
+  }
+  return null;
+})()"""
+
+SPEC_SHEET = r"""(() => {
+  const root = document.querySelector('[data-testid="brix-sheet-content"]');
+  if (!root) return null;
+  const out = {};
+  for (const h3 of root.querySelectorAll('h3')) {
+    const rows = {};
+    for (const row of h3.parentElement.querySelectorAll(':scope > div')) {
+      if (row.children.length < 2) continue;
+      const k = row.children[0].innerText.trim(), v = row.children[1].innerText.trim();
+      if (k) rows[k] = v;
+    }
+    out[h3.innerText.trim()] = rows;
+  }
+  return out;
+})()"""
+
+def safe_js(expr, tries=6):
+    for _ in range(tries):
+        try:
+            return js(expr)
+        except (RuntimeError, TimeoutError):  # main thread busy right after navigation
+            wait(2)
+    return None
+
+def nav(url):
+    # Best Buy pages keep the main thread busy; give Page.navigate more than the 5 s default
+    cdp("Page.navigate", url=url, _response_timeout=30)
+
+def click_button_named(name):
+    try:  # every CDP call here can exceed the 5 s default while the page is busy
+        nodes = cdp("Accessibility.getFullAXTree", _response_timeout=30)["nodes"]
+        for n in nodes:
+            if n.get("role", {}).get("value") == "button" and (n.get("name", {}).get("value") or "").strip().lower() == name.lower():
+                bid = n["backendDOMNodeId"]
+                cdp("DOM.scrollIntoViewIfNeeded", backendNodeId=bid, _response_timeout=30)
+                wait(0.5)
+                q = cdp("DOM.getBoxModel", backendNodeId=bid, _response_timeout=30)["model"]["content"]
+                click_at_xy(sum(q[0::2]) / 4, sum(q[1::2]) / 4)
+                return True
+    except (RuntimeError, TimeoutError):
+        pass  # the caller retries
+    return False
+
+# The main product's price block. Accessory, warranty, sponsored and "consider" carousels
+# also use data-testid="price-block" and "price-block-regular-price", but sit outside this
+# container, so never read those test ids page-wide.
+MAIN_PRICE = '[data-testid="bestbuy-price-ui-price-experience"] [data-testid="price-block"]'
+
+MAIN_PRICES = r"""(() => {
+  const money = e => { const m = e && e.innerText.match(/\$([\d,]+\.\d{2})/); return m ? parseFloat(m[1].replace(/,/g, '')) : null; };
+  const block = document.querySelector('%s');
+  if (!block) return null;
+  return {price: money(block.querySelector('[data-testid="price-block-customer-price"]')),
+          regular: money(block.querySelector('[data-testid="price-block-regular-price"]'))};
+})()""" % MAIN_PRICE
+
+def get_product(sku):
+    # /site/<sku>.p?skuId=<sku> redirects to the canonical /product/<slug>/<code> URL
+    nav(f"https://www.bestbuy.com/site/{sku}.p?skuId={sku}")
+    ld, state = None, None
+    for _ in range(30):  # JSON-LD arrives with the HTML; the page state and price block hydrate later
+        wait(1.5)
+        ld = ld or safe_js(PRODUCT_LD)
+        # a second isPDP entry for the same SKU can appear with priceType null; take the filled one
+        state = safe_js(f"((window._BBY_DATA_ || {{}}).skus || []).find(s => s.id === '{sku}' && s.isPDP && s.priceType) || null")
+        if ld and state and safe_js(f"!!document.querySelector('{MAIN_PRICE} [data-testid=\"price-block-customer-price\"]')"):
+            break
+    if not ld:
+        return None
+    state = state or {}
+    offers = ld.get("offers") or []
+    if isinstance(offers, dict):
+        offers = [offers]
+    new = next((o for o in offers if "NewCondition" in (o.get("itemCondition") or "")), offers[0] if offers else {})
+    # Main product only: its "Comp. Value" line shows when it is discounted, else regular is None
+    main = safe_js(MAIN_PRICES) or {}
+    regular = main.get("regular")
+    specs = None
+    for _ in range(3):  # a click before hydration finishes does nothing, so retry
+        if not click_button_named("See all specifications"):
+            wait(2)
+            continue
+        for _ in range(8):
+            wait(1)
+            specs = safe_js(SPEC_SHEET)
+            if specs:
+                break
+        if specs:
+            break
+    try:
+        press_key("Escape")  # close the sheet
+    except (RuntimeError, TimeoutError):
+        pass
+    rating = ld.get("aggregateRating") or {}
+    return {
+        "sku": ld.get("sku"),
+        "title": ld.get("name"),
+        "brand": (ld.get("brand") or {}).get("name"),
+        "model": ld.get("model"),
+        "url": ld.get("url"),
+        "price": new.get("price"),
+        "price_block_price": main.get("price"),          # should equal price
+        "regular_price": regular,                        # None when the main product is not discounted
+        "on_sale": regular is not None and main.get("price") is not None and main["price"] < regular,
+        "availability": (new.get("availability") or "").rsplit("/", 1)[-1],
+        "price_type": state.get("priceType"),           # "regular" / "onSale"; None if the state never hydrated
+        "button_state": state.get("primaryButtonState"),  # e.g. "ADD_TO_CART"
+        "rating": rating.get("ratingValue"),
+        "review_count": rating.get("reviewCount"),
+        "other_offers": [{"condition": o.get("description"), "price": o.get("price")} for o in offers if o is not new],
+        "specs": specs,
+    }
+
+activate_tab(current_tab())  # a hidden (background) tab never hydrates
+# Pick a SKU from a live search so this block does not depend on a hard-coded product.
+nav("https://www.bestbuy.com/site/searchpage.jsp?st=laptop")
+skus = []
+for _ in range(20):
+    wait(1.5)
+    skus = safe_js("[...new Set(((window._BBY_DATA_ || {}).skus || []).filter(s => s.id && !s.isSponsored).map(s => s.id))]") or []
+    if len(skus) >= 5:  # the list fills in as the page hydrates
+        break
+print("organic SKUs on page:", skus[:5])
+# Scrape organic SKUs until there is one discounted and one full-price product to show both cases.
+shown = set()
+for sku in skus[:12]:
+    product = get_product(sku)
+    if not product:
+        print(sku, "no product data")
+        continue
+    specs = product.pop("specs") or {}
+    print(sku, "on_sale", product["on_sale"], "price", product["price"], "price block", product["price_block_price"],
+          "regular", product["regular_price"], "price_type", product["price_type"])
+    if product["on_sale"] in shown:
+        continue
+    shown.add(product["on_sale"])
+    print(json.dumps(product, indent=1))
+    print(sum(len(v) for v in specs.values()), "spec rows in", len(specs), "sections")
+    print(json.dumps({k: specs[k] for k in list(specs)[:3]}, indent=1))
+    if shown == {True, False}:
+        break
+```
+
+Real output (trimmed, 2026-10-23):
+
+```
+organic SKUs on page: ['6667483', '13214744', '12341769', '6673811', '6667482']
+6667483 on_sale True price 209.99 price block 209.99 regular 349.99 price_type onSale
+{
+ "sku": "6667483",
+ "title": "HP - 14\" Laptop - Intel N150 Processor - 4GB Memory - 128GB Storage - Pale Rose Gold",
+ "brand": "HP", "model": "14-dq6105dx",
+ "url": "https://www.bestbuy.com/product/hp-14-laptop-intel-n150-processor-4gb-memory-128gb-storage-pale-rose-gold/JJGW3FGF9T",
+ "price": 209.99, "price_block_price": 209.99, "regular_price": 349.99, "on_sale": true,
+ "availability": "InStock", "price_type": "onSale", "button_state": "ADD_TO_CART", "rating": 4.4, "review_count": 135,
+ "other_offers": [{"condition": "Open-Box Excellent", "price": 197.99}, {"condition": "Open-Box Good", "price": 191.99},
+                  {"condition": "Open-Box Fair", "price": 184.99}]
+}
+83 spec rows in 17 sections
+{"Key Specs": {"Screen Type": "TN", "Screen Size": "14 inches", "Processor Model": "Intel Processor N150", ...},
+ "General": {"Brand": "HP", "Model Number": "14-dq6105dx", "Color": "Pale Rose Gold", "Year of Release": "2026"},
+ "Display": {"Display Type": "LED", "Screen Size": "14 inches", "Refresh Rate": "60Hz", "Brightness": "250 nits", ...}}
+13214744 on_sale True price 337 price block 337 regular 399.99 price_type None
+12341769 on_sale True price 829 price block 829 regular 1199.99 price_type onSale
+6673811 on_sale True price 199 price block 199 regular 419 price_type onSale
+6667482 on_sale True price 199.99 price block 199.99 regular 349.99 price_type onSale
+6615874 on_sale False price 699 price block 699 regular None price_type regular
+{
+ "sku": "6615874",
+ "title": "Apple - MacBook Neo 13-inch Laptop - A18 Pro chip with 6‑core CPU and 5‑core GPU - 8GB Memory - 256GB SSD - Indigo",
+ "brand": "Apple", "model": "MHFF4LL/A",
+ "price": 699, "price_block_price": 699, "regular_price": null, "on_sale": false,
+ "availability": "InStock", "price_type": "regular", "button_state": "ADD_TO_CART", "rating": 4.9, "review_count": 1465, ...
+}
+52 spec rows in 16 sections
+...
+```
+
+`regular_price` is `null` for the full-price MacBook even though its page has 6+ other `price-block-regular-price` elements in carousels (31 after scrolling to the bottom).
+
+### Product page fields
+
+| Field | Source | Notes |
+|---|---|---|
+| `sku`, `title`, `brand`, `model`, `url` | JSON-LD `Product`: `sku`, `name`, `brand.name`, `model`, `url` | In the initial HTML; there are also `BreadcrumbList` and video `ItemList` JSON-LD blocks |
+| `price`, `availability` | JSON-LD `offers[]` entry whose `itemCondition` is `NewCondition` | `availability` is the schema.org suffix, e.g. `InStock` |
+| `other_offers` | other JSON-LD `offers[]` | Open-Box Excellent / Good / Fair |
+| `price_block_price`, `regular_price` | `[data-testid="price-block-customer-price"]` and `[data-testid="price-block-regular-price"]` inside the main product's `[data-testid="bestbuy-price-ui-price-experience"] [data-testid="price-block"]` | `regular_price` (the main block's "Comp. Value: $419.00" line) is `None` when the main product is not discounted. `price_block_price` matched JSON-LD `price` on all 6 laptops checked. Never read these test ids page-wide: warranty, sponsored, "consider" and other product carousels reuse them, and on the undiscounted $699.00 MacBook the first page-wide match was another card's "The price was $419.00". The container appears twice (top and a lower duplicate), both for the main product |
+| `on_sale` | `regular_price` present and above `price_block_price` | Works even when `price_type` is `None` |
+| `price_type`, `button_state` | `window._BBY_DATA_.skus` entry with `isPDP: true` and a non-null `priceType` (`priceType`, `primaryButtonState`) | Hydrates 10-20 s after JSON-LD, and a second `isPDP` entry with `priceType: null` can show up. On 1 of 6 laptops (`13214744`) it never hydrated within the 45 s wait, so both are `None`. Same entry has `unitPrice`, `altSellerPriceMin/Max`, `userGeneratedContent.ratingAverage/reviewsCount` |
+| `rating`, `review_count` | JSON-LD `aggregateRating.ratingValue` / `reviewCount` | |
+| `specs` | "See all specifications" sheet `[data-testid="brix-sheet-content"]`: each `h3` is a section, each direct child `div` is a row of label and value | Section "Other" holds `UPC`, `BSIN` (the code at the end of the product URL) and `SKU`. 52, 83 and 84 rows on the three laptops checked |
+
+### URL patterns
+
+| URL | Observed |
+|---|---|
+| `/site/searchpage.jsp?st=<url-encoded query>&cp=<page>` | Search results; Best Buy adds `id=pcat17071` itself |
+| `/site/<sku>.p?skuId=<sku>` | Redirects to the canonical `/product/<slug>/<code>` page |
+| `/product/<slug>/<code>` | Product page |
+| `cp` past the last page | "We're unable to display products at the moment", 0 cards. Example for `rtx 5090` (counts drift between runs): 104 results, 20 cards on pages 1-3, 16 on page 6, none on page 9 |
+
+---
+
+## Gotchas
+
+- **Background tab means endless skeletons.** With `document.visibilityState == "hidden"` the search page stayed at "Main Content / Loading..." with 0 titles for 20+ s. After `activate_tab(current_tab())`, 16 titles rendered within 2 s. Keep one visible working tab and close extras.
+- **Busy main thread.** Right after navigation, `Runtime.evaluate` and `Page.navigate` sometimes exceeded browser-harness's 5 s IPC default (`Runtime.evaluate timed out`, `Page.navigate timed out after 5s`). `DOM.getBoxModel` timed out the same way while clicking "See all specifications". The blocks pass `_response_timeout=30` to those CDP calls and retry on `RuntimeError` or `TimeoutError` (browser-harness raises a `TimeoutError` subclass for IPC timeouts). Once a tab hung mid-navigation (title stuck as the URL, every evaluate timing out); `cdp("Page.stopLoading")` plus a new navigate recovered it.
+- **Lazy price blocks.** One top-to-bottom scroll left some cards unpriced; scrolling each unpriced card into view filled them in (24 of 24 on pages 2 and 3). The retry includes "Unavailable" and "Sold Out" cards, which do get a price block when in view; the loop gives up after 3 passes, so a card that never renders one keeps `price: null`.
+- **Hydration order on product pages.** JSON-LD is there first; the main price block and `_BBY_DATA_.skus` arrive later (the `isPDP` entry took 12-18 s in one trace, and once did not appear within 20 s). A "See all specifications" click before hydration did nothing, hence the wait and retry.
+- **Store and ZIP come from your IP.** The header shows a nearby store; pickup and shipping text depend on it. A different exit location can change those fields and sometimes ranking.
+- **Sponsored duplicates.** One SKU appeared as both a sponsored and an organic card on the same page, and a few SKUs repeat across `cp` pages. Dedupe on `sku`.
+- **Selector drift.** The site is a Next.js app with utility-class styling. Rely on `data-testid`, `data-product-id`, JSON-LD and `_BBY_DATA_`; avoid class names other than `product-list-item` and `slContainer`.
+- **No consent banner** appeared for the US cloud browser, so there is nothing to dismiss.
+- **Pacing.** About 40 page loads over roughly an hour from one session produced no block page or CAPTCHA. The search block sleeps 3 s between pages; do not go faster on larger crawls.
+
+## What does not work
+
+- `http_get`, curl or urllib against `www.bestbuy.com` search or product pages: no response before timeout, with either user agent.
+- `api.bestbuy.com/v1/products(...)` without an API key: HTTP 403 `{"errorMessage":"We were unable to locate your API Key."}`. This is Best Buy's official, structured product API: developer.bestbuy.com has a "Get API Key" signup, and the documented form is `https://api.bestbuy.com/v1/products(search=laptop)?format=json&apiKey=<your key>` (the docs warn about per-second query limits). If you can register for a key, prefer it over scraping; it was not tested here because no key was used.
+- Embedded data on search pages: no `__NEXT_DATA__`, no JSON-LD, the Apollo SSR transport was empty and `self.__next_f` contained no `skuId`. Prices and fulfillment load through client-side POSTs to `/gateway/graphql` (operations such as `PriceBlockInit_Compact_GetProduct`); those were not replayed here, so read the rendered DOM.
+- Specs in the initial product page DOM: the UPC was absent from `document.body.innerText` until the sheet was opened.
