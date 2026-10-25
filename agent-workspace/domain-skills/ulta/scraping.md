@@ -65,7 +65,9 @@ def fetch(url, deadline_s=120):
                 raise SystemExit(f"HTTP {status} on {url}: Ulta is refusing or rate-limiting. Stop and back off.")
             if 400 <= status < 500:
                 raise RuntimeError(f"HTTP {status} on {url}")
-            if status < 400:
+            if 300 <= status < 400:
+                raise RuntimeError(f"HTTP {status} on {url}: unhandled redirect or not-modified, no body to parse")
+            if 200 <= status < 300:
                 if final_url != url:
                     raise RuntimeError(f"asked for {url}, was redirected to {final_url}")
                 return body.decode("utf-8")
@@ -412,7 +414,9 @@ def fetch(url, deadline_s=120):
                 raise SystemExit(f"HTTP {status} on {url}: Ulta is refusing or rate-limiting. Stop and back off.")
             if 400 <= status < 500:
                 raise RuntimeError(f"HTTP {status} on {url}")
-            if status < 400:
+            if 300 <= status < 400:
+                raise RuntimeError(f"HTTP {status} on {url}: unhandled redirect or not-modified, no body to parse")
+            if 200 <= status < 300:
                 got, want = urllib.parse.urlsplit(final_url), urllib.parse.urlsplit(url)
                 if got.path != want.path or (want.query and urllib.parse.parse_qs(got.query) != urllib.parse.parse_qs(want.query)):
                     raise RuntimeError(f"asked for {url}, was redirected to {final_url}")
