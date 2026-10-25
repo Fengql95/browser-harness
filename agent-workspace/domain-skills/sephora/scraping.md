@@ -1,6 +1,6 @@
 # Sephora — Category Listings & Product Details
 
-Field-tested against www.sephora.com on 2026-10-23 using a Browser Use cloud browser (plain HTTP was also tried and refused).
+Field-tested against www.sephora.com on 2026-10-23 and 2026-10-24 using a Browser Use cloud browser (plain HTTP was also tried and refused).
 
 robots.txt (fetched 2026-10-23) for `User-agent: *` disallows `/search`, `/browse/`, `/gway/`, `/basket`, `/profile/...` and others, allows `/shop/` category pages, `/brand/` pages and `/product/` pages, and sets `Crawl-delay: 5`. This skill only loads `/`, `/shop/<slug>`, `/brand/<slug>` and `/product/<slug>-P<id>` and waits 5 s between page loads.
 
@@ -27,10 +27,10 @@ if not re.fullmatch(r"https://www\.sephora\.com/(shop|brand)/[a-z0-9-]+", LIST_U
     raise SystemExit("LIST_URL must be https://www.sephora.com/shop/<slug> or /brand/<slug>, no query string")
 
 def load(url, timeout=30):
-    """Navigate the attached tab, confirm location.href, return the page's linkStore JSON."""
+    """Navigate the attached tab, wait until location.href is exactly url, return the page's linkStore JSON."""
     goto_url(url)
-    deadline, state = time.time() + timeout, {}
-    while time.time() < deadline:
+    deadline = time.time() + timeout
+    while True:
         state = js("""(() => ({href: location.href, title: document.title, ready: document.readyState,
                        store: document.getElementById('linkStore')?.textContent || ''}))()""") or {}
         if "Access Denied" in (state.get("title") or ""):
@@ -38,8 +38,9 @@ def load(url, timeout=30):
                              "Stop and back off; do not retry in a loop.")
         if state.get("href") == url and state.get("ready") == "complete" and state.get("store"):
             return json.loads(state["store"])
+        if time.time() >= deadline:
+            raise RuntimeError(f"{url} did not load with a linkStore in {timeout} s, tab is on {state.get('href')}")
         time.sleep(0.5)
-    raise RuntimeError(f"{url} did not load with a linkStore in {timeout} s, tab is on {state.get('href')}")
 
 def parse(p):
     sku = p.get("currentSku") or {}
@@ -60,14 +61,15 @@ def parse(p):
 
 # Reuse a tab already on sephora.com, otherwise enter via the homepage
 # (in a fresh browser the first direct /shop/ load was denied in testing, the homepage was not).
+opened_tab = None   # set only if this block opened the tab; it never closes a tab it did not open
 href = js("location.href") or ""
 if not href.startswith("https://www.sephora.com/"):
-    new_tab("https://www.sephora.com/")
+    opened_tab = new_tab("https://www.sephora.com/")
     wait_for_load()
     if "Access Denied" in (js("document.title") or ""):
         raise SystemExit("Sephora denied the homepage for this browser. Stop and back off.")
 
-rows, seen, listing = [], set(), {}
+rows, seen, listing, total, size, pages_read = [], set(), {}, 0, 60, 0
 for page in range(1, MAX_PAGES + 1):
     time.sleep(PAUSE)
     url = LIST_URL if page == 1 else f"{LIST_URL}?currentPage={page}"
@@ -77,21 +79,34 @@ for page in range(1, MAX_PAGES + 1):
         raise RuntimeError(f"{url} has no page.nthCategory / page.nthBrand in linkStore: {list(pg)}")
     if int(listing.get("currentPage") or 1) != page:   # page 1 has currentPage None
         raise RuntimeError(f"asked for page {page}, linkStore says currentPage={listing.get('currentPage')}")
+    if listing.get("totalProducts") is None:
+        raise RuntimeError(f"{url}: listing has no totalProducts, cannot tell when the walk is complete")
+    total, size = int(listing["totalProducts"]), int(listing.get("pageSize") or 60)
     products = listing.get("products") or []
+    if not products and (page - 1) * size < total:
+        raise RuntimeError(f"{url} has 0 products but totalProducts={total} means page {page} should not be empty")
     for p in products:
+        if not p.get("productId") or not p.get("targetUrl"):   # required: identity and link
+            raise RuntimeError(f"{url}: product card without productId/targetUrl, keys {sorted(p)[:12]}")
         row = parse(p)
         if row["product_id"] in seen:
             continue
         seen.add(row["product_id"])
         rows.append(row)
-    total, size = int(listing.get("totalProducts") or 0), int(listing.get("pageSize") or 60)
+    pages_read = page
     print(f"page {page}/{-(-total // size)}: {len(products)} products, {len(rows)} unique so far")
-    if not products or page * size >= total:
+    if page * size >= total:
         break
 
-print(listing.get("displayName"), listing.get("categoryId") or listing.get("brandId"),
-      "totalProducts:", listing.get("totalProducts"))
+pages_total = -(-total // size)
+print(listing.get("displayName"), listing.get("categoryId") or listing.get("brandId"), "totalProducts:", total)
+if pages_read >= pages_total:
+    print(f"status: complete, {pages_read}/{pages_total} pages read, {len(rows)} unique rows")
+else:
+    print(f"status: PARTIAL, MAX_PAGES={MAX_PAGES} reached at page {pages_read}/{pages_total}: "
+          f"{len(rows)} of {total} products, raise MAX_PAGES for the rest")
 print(json.dumps(rows[:2], indent=1, ensure_ascii=False))
+print(f"tab: opened {opened_tab}" if opened_tab else "tab: reused the existing sephora.com tab")
 ```
 
 Observed output (fresh cloud browser, trimmed):
@@ -101,6 +116,7 @@ page 1/9: 60 products, 60 unique so far
 page 2/9: 60 products, 120 unique so far
 page 3/9: 60 products, 180 unique so far
 Face Serums cat60103 totalProducts: 519
+status: PARTIAL, MAX_PAGES=3 reached at page 3/9: 180 of 519 products, raise MAX_PAGES for the rest
 [
  {
   "product_id": "P94421",
@@ -118,9 +134,10 @@ Face Serums cat60103 totalProducts: 519
  },
  ...
 ]
+tab: opened 458A283D2E3A9A0E04151F5C7C8BB2D6
 ```
 
-With `MAX_PAGES = 20` the same category walked all 9 pages (`?currentPage=2` to `?currentPage=9`, the last with 39 products) and returned 519 unique rows, equal to `totalProducts`. `LIST_URL = "https://www.sephora.com/brand/the-ordinary"` returned 60 + 7 = 67 rows over 2 pages, equal to its `totalProducts`.
+The `status:` line says whether the walk is complete; with the default `MAX_PAGES = 3` it is `PARTIAL`, so never treat those rows as the whole category. With `MAX_PAGES = 20` the same category walked all 9 pages (`?currentPage=2` to `?currentPage=9`, the last with 39 products) and printed `status: complete, 9/9 pages read, 519 unique rows`, equal to `totalProducts`. `LIST_URL = "https://www.sephora.com/brand/the-ordinary"` printed `status: complete, 2/2 pages read, 67 unique rows` (60 + 7), equal to its `totalProducts`. The block raises instead of returning rows when a page before `totalProducts` is reached comes back empty, a card has no `productId` or `targetUrl`, or the listing has no `totalProducts`.
 
 ### 2. Product details and all variants (browser, embedded `linkStore` + JSON-LD)
 
@@ -142,31 +159,35 @@ def text(s):
     return re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", s or ""))).strip()
 
 # Reuse a tab already on sephora.com (e.g. after the category block), otherwise enter via the homepage.
+opened_tab = None   # set only if this block opened the tab; it never closes a tab it did not open
 href = js("location.href") or ""
 if not href.startswith("https://www.sephora.com/"):
-    new_tab("https://www.sephora.com/")
+    opened_tab = new_tab("https://www.sephora.com/")
     wait_for_load()
     if "Access Denied" in (js("document.title") or ""):
         raise SystemExit("Sephora denied the homepage for this browser. Stop and back off.")
 time.sleep(PAUSE)
 
 goto_url(PRODUCT_URL)
-deadline, state = time.time() + 30, {}
-while time.time() < deadline:
+deadline = time.time() + 30
+while True:
     state = js("""(() => ({href: location.href, title: document.title, ready: document.readyState,
                    store: document.getElementById('linkStore')?.textContent || '',
                    ld: [...document.querySelectorAll('script[type="application/ld+json"]')].map(s => s.textContent)}))()""") or {}
     if "Access Denied" in (state.get("title") or ""):
         raise SystemExit(f"'Access Denied' (HTTP 403) for {PRODUCT_URL}. Stop and back off.")
-    if state.get("href", "").split("?")[0] == PRODUCT_URL and state.get("ready") == "complete" and state.get("store"):
+    on_url = re.fullmatch(re.escape(PRODUCT_URL) + r"(\?skuId=\d+)?", state.get("href") or "")
+    if on_url and state.get("ready") == "complete" and state.get("store"):
         break
+    if time.time() >= deadline:
+        raise RuntimeError(f"{PRODUCT_URL} did not load with a linkStore in 30 s, tab is on {state.get('href')}")
     time.sleep(0.5)
-else:
-    raise RuntimeError(f"{PRODUCT_URL} did not load with a linkStore in 30 s, tab is on {state.get('href')}")
 
 prod = (json.loads(state["store"]).get("page") or {}).get("product")
 if not prod or prod.get("productId") != PRODUCT_ID:
     raise RuntimeError(f"linkStore has no page.product for {PRODUCT_ID} (got {prod and prod.get('productId')})")
+if not all(s.get("skuId") for s in prod.get("regularChildSkus") or [prod.get("currentSku") or {}]):
+    raise RuntimeError(f"{PRODUCT_ID}: a variant SKU has no skuId")
 
 # JSON-LD ProductGroup: per-variant price + availability (skip its 'reviews', they carry reviewer handles)
 offers = {}
@@ -221,6 +242,7 @@ detail = {
 }
 print(json.dumps({**detail, "variants": variants[:3]}, indent=1, ensure_ascii=False))
 print("variants with JSON-LD offer:", sum(1 for v in variants if v["availability"]), "of", len(variants))
+print(f"tab: opened {opened_tab}" if opened_tab else "tab: reused the existing sephora.com tab")
 ```
 
 Observed output (same browser, right after block 1, trimmed to 3 of 71 variants):
@@ -234,7 +256,7 @@ Observed output (same browser, right after block 1, trimmed to 3 of 71 variants)
  "category": "Foundation",
  "rating": 4.259,
  "reviews": 1197,
- "loves": 49902,
+ "loves": 49904,
  "variation_type": "Color",
  "default_sku": "3018157",
  "price": "$39.00",
@@ -260,9 +282,10 @@ Observed output (same browser, right after block 1, trimmed to 3 of 71 variants)
  ]
 }
 variants with JSON-LD offer: 71 of 71
+tab: reused the existing sephora.com tab
 ```
 
-When done, close the tab with `close_tab()`.
+Neither block closes a tab. Each ends with `tab: opened <targetId>` if it opened the tab itself, or `tab: reused ...` if it ran in a tab that was already on sephora.com. When done, close only a tab your own run opened, by that id: `close_tab("<targetId>")`. A reused tab belongs to whoever opened it.
 
 ## Fields
 
@@ -292,7 +315,7 @@ Product page (`page.product`, block 2):
 | Field | Path | Example / notes |
 |---|---|---|
 | Product ID | `productId` | `"P516457"` |
-| Name, rating, reviews, loves | `productDetails.displayName`, `.rating`, `.reviews`, `.lovesCount` | `4.259`, `1197`, `49897` (numbers here, not strings) |
+| Name, rating, reviews, loves | `productDetails.displayName`, `.rating`, `.reviews`, `.lovesCount` | `4.259`, `1197`, `49904` (numbers here, not strings) |
 | Brand | `currentSku.brandName`, `productDetails.brand.brandId` | `"MAC Cosmetics"`, `"8010"` |
 | Category | `parentCategory.displayName` | `"Foundation"` |
 | Descriptions | `productDetails.shortDescription`, `.longDescription`, `.suggestedUsage` | HTML strings |
@@ -303,13 +326,13 @@ Product page (`page.product`, block 2):
 
 ## Gotchas
 
-- **`Access Denied` happens, and it is a stop signal.** Observed on 2026-10-23 in the first cloud browser: its first navigation, straight to `/shop/moisturizing-cream-oils-mists`, got Akamai `Access Denied`; 60 s later the homepage loaded fine, but a direct load of the same category right after it was denied again. Later in that same browser (after a few minutes on the site) direct `/shop/`, `/brand/` and `/product/` loads all worked. In 2 later fresh cloud browsers, block 1 (homepage, 5 s pause, then direct category loads) was never denied. The blocks raise `SystemExit` on any `Access Denied` title; when that happens stop and back off for several minutes rather than retrying or rotating browsers.
+- **`Access Denied` happens, and it is a stop signal.** Observed on 2026-10-23 in the first cloud browser: its first navigation, straight to `/shop/moisturizing-cream-oils-mists`, got Akamai `Access Denied`; 60 s later the homepage loaded fine, but a direct load of the same category right after it was denied again. Later in that same browser (after a few minutes on the site) direct `/shop/`, `/brand/` and `/product/` loads all worked. In 3 later fresh cloud browsers (2026-10-23 and 2026-10-24), block 1 (homepage, 5 s pause, then direct category loads) was never denied. The blocks raise `SystemExit` on any `Access Denied` title; when that happens stop and back off for several minutes rather than retrying or rotating browsers.
 - **Client-side navigation does not refresh `linkStore`.** Clicking a category link inside the site loads products through a separate XHR and leaves the homepage's `linkStore` in the DOM (`page.home`). The blocks use full page loads (`goto_url`) and check `location.href` plus the page type (`nthCategory` / `nthBrand` / `product.productId`) before reading.
 - **"Show More Products" is not pagination.** On Face Serums it sent no new product request (all 60 of the page were already in `linkStore`); it only renders more tiles. Use `?currentPage=N`.
 - **Lazy-loaded tiles.** The DOM only had 4 to 12 `ProductTile` elements rendered at a time, while `linkStore` had all 60. Do not scrape tiles.
 - **Location.** The header shows a store and delivery ZIP picked from the browser's IP. The listing's `pickupEligible` / `sameDayEligible` / `shipToHomeEligible` flags were `false` on every product in the server-rendered `linkStore` (Face Serums page 2), so treat them as unreliable there and check availability on the product page (block 2).
 - **`/sale` is a content page** with no `products` in `linkStore`; use a `/shop/` category or a `/brand/` page.
-- **Pacing.** robots.txt asks for `Crawl-delay: 5`; the blocks sleep 5 s before every page load. In the last test browser, 17 page loads at that pace (including the full 9-page Face Serums walk) produced no denial; faster rates were not tested.
+- **Pacing.** robots.txt asks for `Crawl-delay: 5`; the blocks sleep 5 s before every page load. In the 2026-10-24 test browser, the homepage plus 15 page loads at that pace (including the full 9-page Face Serums walk) produced no denial; faster rates were not tested.
 - No cookie/consent banner appeared in the page text of the homepage, category or product pages from a US exit IP.
 
 ## What does not work

@@ -1,15 +1,15 @@
 # Dice — Tech Job Search Scraping
 
-Field-tested against www.dice.com on 2026-10-23 using a Browser Use cloud browser and plain HTTP (Python urllib).
+Field-tested against www.dice.com on 2026-10-23 and 2026-10-24 using a Browser Use cloud browser and plain HTTP (Python urllib).
 
-robots.txt (fetched 2026-10-23) disallows `/jobs?q*`, `/jobsearch/` and `/job` for `User-agent: *` but allows `/jobs` and `/job-detail`, so this skill only requests the `/jobs/q-<keyword>-l-<location>-jobs` search pages (the same shape Dice lists in its own `sitemap_ts.xml` / `sitemap_tsl1.xml`) and `/job-detail/<guid>`.
+robots.txt (fetched 2026-10-24) disallows `/jobs?q*`, `/jobsearch/` and `/job` for `User-agent: *` but allows `/jobs` and `/job-detail`, so this skill only requests the `/jobs/q-<keyword>-l-<location>-jobs` search pages (the same shape Dice lists in its own `sitemap_ts.xml` / `sitemap_tsl1.xml`) and `/job-detail/<guid>`.
 
 ## Quick summary
 
 - Search result pages are server-rendered Next.js (App Router). Every page embeds the full result set as JSON inside `self.__next_f.push([1,"..."])` script strings, under a `"jobList":` key: `data` (20 jobs) + `meta` (`currentPage`, `pageCount`, `totalResults`, facets).
-- Plain HTTP works: a truthful custom User-Agent got HTTP 200 and the full JSON on every request in this run (about 80 page requests, mostly at a 2 s pace, no 429, no challenge, no consent banner).
-- Page size is fixed at 20. Pages past 25 are clamped: `?page=26` and `?page=46` both returned `currentPage: 25`. So one search yields at most 500 jobs even when `pageCount` says 46.
-- Relevance order is not stable between requests, so deep pagination repeats and skips some jobs (78-99 unique per 100 slots measured). De-dup on `guid`.
+- Plain HTTP works: a truthful custom User-Agent got HTTP 200 and the full JSON on every request in these runs (about 100 page requests, mostly at a 2 s pace, no 429, no challenge, no consent banner).
+- Page size is fixed at 20. Pages past 25 are clamped: `?page=26` and `?page=46` both returned `currentPage: 25`. So one search yields at most 500 jobs even when `pageCount` says 46. Treat that as a hard stop.
+- Relevance order is not stable between requests, so deep pagination repeats and skips some jobs (78-99 unique per 100 slots measured). De-dup on `guid`, and the helpers below return `status: "partial"` with a reason whenever fewer than `totalResults` jobs were collected.
 - `/job-detail/<guid>` pages carry a schema.org `JobPosting` JSON-LD block (full description, `validThrough`, postal address).
 - The browser path works too (same JSON, read from the inline scripts), but it is not needed for logged-out search.
 
@@ -17,15 +17,20 @@ robots.txt (fetched 2026-10-23) disallows `/jobs?q*`, `/jobsearch/` and `/job` f
 
 ### 1. Search + paginate over plain HTTP (main method)
 
-Self-contained, standard library only. Builds the public `/jobs/q-...-jobs` path, follows `?page=N`, stops at `pageCount` or at the 25-page clamp, de-duplicates by `guid`, and raises (no silent partial data) on blocks or layout changes.
+Self-contained, standard library only. Builds the public `/jobs/q-...-jobs` path, follows `?page=N`, stops at `pageCount`, at `max_pages` or at Dice's 25-page cap, de-duplicates by `guid`, validates each page, and raises on challenge pages, blocks or layout changes. `fetch` retries only 429/5xx and network errors (timeouts, resets) inside one 120 s deadline, with no sleep after the last attempt; a challenge page is never retried.
 
 ```python
-import json, re, time, urllib.error, urllib.parse, urllib.request
+import http.client, json, re, time, urllib.error, urllib.parse, urllib.request
 
 UA = "dice-jobs-research/1.0 (python-urllib; personal job search script)"
 BASE = "https://www.dice.com"
-MAX_PAGE = 25        # pages past 25 come back as page 25
-PAUSE_S = 2.0        # polite gap between page requests
+MAX_PAGE = 25          # Dice's cap: pages past 25 come back as page 25. Hard stop.
+PAUSE_S = 2.0          # polite gap between page requests
+DEADLINE_S = 120       # one budget per fetch(), across all attempts and backoff
+DELAYS = (5, 15, 40)   # backoff between attempts, never after the last one
+CHALLENGE = re.compile(r"cf-chl|/cdn-cgi/challenge-platform|px-captcha|captcha-delivery\.com|"
+                       r"_Incapsula_Resource|g-recaptcha|h-captcha|"
+                       r"<title>\s*(?:Access Denied|Just a moment|Attention Required)", re.I)
 
 def search_url(keyword=None, location=None, page=1, filters=None):
     """Public search path /jobs/q-<kw>-l-<loc>-jobs. Hyphens are path separators
@@ -43,32 +48,57 @@ def search_url(keyword=None, location=None, page=1, filters=None):
     url = f"{BASE}/jobs/{'-'.join(parts)}-jobs"
     return url + ("?" + urllib.parse.urlencode(params) if params else "")
 
-def fetch(url, attempts=4):
-    """GET with capped backoff (5+15+40 s = 60 s max), no sleep after the last try."""
-    delays = [5, 15, 40]
+def fetch(url, attempts=4, deadline_s=DEADLINE_S):
+    """GET under one overall deadline. Retries 429/5xx, timeouts and connection
+    errors with DELAYS backoff; raises at once on redirects, other HTTP errors
+    and challenge pages."""
+    if not 1 <= attempts <= len(DELAYS) + 1:
+        raise ValueError(f"attempts must be 1..{len(DELAYS) + 1}")
+    if not 0 < deadline_s <= 120:
+        raise ValueError("deadline_s must be in (0, 120]")
+    end = time.monotonic() + deadline_s
     for i in range(attempts):
+        left = end - time.monotonic()
+        if left <= 0:
+            raise TimeoutError(f"{deadline_s}s deadline used up for {url}")
         try:
             req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "text/html"})
-            with urllib.request.urlopen(req, timeout=30) as r:
-                if r.geturl() != url:
-                    raise RuntimeError(f"redirected to {r.geturl()}")
-                return r.read().decode("utf-8")
+            with urllib.request.urlopen(req, timeout=min(30, left)) as r:
+                final, html = r.geturl(), r.read().decode("utf-8")
         except urllib.error.HTTPError as e:
             if e.code not in (429, 500, 502, 503, 504) or i == attempts - 1:
                 raise
-        except urllib.error.URLError:
+            err = f"HTTP {e.code}"
+        except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.HTTPException) as e:
             if i == attempts - 1:
                 raise
-        time.sleep(delays[i])
+            err = repr(e)
+        else:
+            if final != url:
+                raise RuntimeError(f"redirected to {final}")
+            if CHALLENGE.search(html):
+                raise RuntimeError(f"challenge/block page at {url} - stop, do not retry")
+            return html
+        if time.monotonic() + DELAYS[i] >= end:
+            raise TimeoutError(f"{deadline_s}s deadline reached for {url} after {i + 1} attempts ({err})")
+        time.sleep(DELAYS[i])
 
 def parse_joblist(html):
-    """Concatenate the RSC strings and decode the object after "jobList":."""
+    """Concatenate the RSC strings, decode the object after "jobList":, validate it."""
     chunks = re.findall(r'self\.__next_f\.push\(\[1,(".*?")\]\)</script>', html, re.S)
     flight = "".join(json.loads(c) for c in chunks)
     i = flight.find('"jobList":')
     if i < 0:
         raise RuntimeError("no jobList in page (layout change or block page) - stop and inspect")
-    return json.JSONDecoder().raw_decode(flight, i + len('"jobList":'))[0]
+    jl = json.JSONDecoder().raw_decode(flight, i + len('"jobList":'))[0]
+    meta, data = jl.get("meta"), jl.get("data")
+    if (not isinstance(meta, dict) or not isinstance(data, list)
+            or any(not isinstance(meta.get(k), int) for k in ("currentPage", "pageCount", "totalResults"))):
+        raise RuntimeError("jobList without data/meta counts - layout change, stop")
+    bad = sum(1 for j in data if not (j.get("guid") and j.get("title") and j.get("detailsPageUrl")))
+    if bad:
+        raise RuntimeError(f"{bad} jobs missing guid/title/detailsPageUrl - layout change, stop")
+    return jl
 
 def normalize(j):
     loc = j.get("jobLocation") or {}
@@ -85,45 +115,60 @@ def normalize(j):
     }
 
 def search_dice(keyword=None, location=None, max_pages=3, filters=None):
-    jobs, seen, total, pages = [], set(), None, None
+    """Returns (jobs, info). info["status"] is "complete" only when at least
+    totalResults unique jobs were collected; otherwise "partial" with a reason."""
+    if max_pages < 1:
+        raise ValueError("max_pages must be >= 1")
+    jobs, seen, meta, reason = [], set(), {}, None
     for page in range(1, min(max_pages, MAX_PAGE) + 1):
         if page > 1:
             time.sleep(PAUSE_S)
         jl = parse_joblist(fetch(search_url(keyword, location, page, filters)))
-        meta = jl.get("meta") or {}
-        total, pages = meta.get("totalResults"), meta.get("pageCount") or 0
-        if meta.get("currentPage") != page:      # clamped past the last servable page
+        meta = jl["meta"]
+        if meta["currentPage"] != page:      # count shrank or clamp: stop, do not guess
+            reason = f"asked for page {page}, Dice returned page {meta['currentPage']}"
             break
-        for j in jl.get("data") or []:
-            if j.get("guid") and j["guid"] not in seen:
+        for j in jl["data"]:
+            if j["guid"] not in seen:
                 seen.add(j["guid"])
                 jobs.append(normalize(j))
-        if page >= pages:
+        if page >= meta["pageCount"]:
             break
-    return jobs, total, pages
+    fetched = page if reason is None else page - 1
+    total, pages = meta["totalResults"], meta["pageCount"]
+    if len(jobs) >= total:
+        status, reason = "complete", None
+    else:
+        status = "partial"
+        if reason is None and pages > fetched:
+            reason = ("Dice 25-page cap (500 jobs max per search)" if fetched == MAX_PAGE
+                      else f"max_pages={max_pages} reached")
+        reason = reason or "relevance order reshuffled between pages (repeats/skips)"
+    return jobs, {"status": status, "reason": reason, "total": total, "page_count": pages,
+                  "pages_fetched": fetched, "collected": len(jobs)}
 
-jobs, total, pages = search_dice("Python Developer", "Houston, TX", max_pages=3)
-print(f"total={total} pageCount={pages} collected={len(jobs)}")
+jobs, info = search_dice("Python Developer", "Houston, TX", max_pages=3)
+print(info)
 for r in jobs[:3]:
     print(json.dumps(r))
 
 # Narrowing with Dice's own filter params (values come from meta.facetQueryResults):
-remote, rtotal, _ = search_dice("DevOps Engineer", max_pages=2,
-                                filters={"filters.workplaceTypes": "Remote"})
-print(f"remote devops total={rtotal} collected={len(remote)}")
+remote, rinfo = search_dice("DevOps Engineer", max_pages=2,
+                            filters={"filters.workplaceTypes": "Remote"})
+print("remote devops:", rinfo)
 ```
 
 Output observed (trimmed):
 
 ```
-total=132 pageCount=7 collected=60
+{'status': 'partial', 'reason': 'max_pages=3 reached', 'total': 132, 'page_count': 7, 'pages_fetched': 3, 'collected': 60}
 {"title": "Python Developer - Houston, TX (Locals only)", "company": "Source Mantra Inc", "location": "Houston, Texas, USA", "workplace": "On-Site", "employment_type": "Third Party, Contract", "posted": "2026-10-23T19:05:49Z", "salary": "$$65 - $70", "url": "https://www.dice.com/job-detail/7a92a6a3-2b6f-49be-9f2a-c6737ea95e2e", "guid": "7a92a6a3-2b6f-49be-9f2a-c6737ea95e2e"}
 {"title": "Python Developer", "company": "Mindlance", "location": "Houston, Texas, USA", "workplace": "On-Site", "employment_type": "Contract", "posted": "2026-10-15T21:57:49Z", "salary": "50 - 58", ...}
 {"title": "Python Developer - AWS, AI, LLM -  ZL", "company": "SES", "location": null, "workplace": "Remote", "employment_type": "Full-time", ...}
-remote devops total=239 collected=40
+remote devops: {'status': 'partial', 'reason': 'max_pages=2 reached', 'total': 239, 'page_count': 12, 'pages_fetched': 2, 'collected': 39}
 ```
 
-With `max_pages=30` the same Houston search returned all 132 jobs over 7 pages and stopped at `pageCount`.
+`collected` is 39, not 40, because page 2 repeated one page-1 job. With `max_pages=30` the same Houston search fetched all 7 pages and stopped at `pageCount`: 132 of 132 jobs on 2026-10-23, 131 of 132 on 2026-10-24 (returned as `status: "partial"`, reason `relevance order reshuffled between pages`). Never report a `partial` result as the full set.
 
 URL shapes that returned 200 with a `jobList`:
 
@@ -137,7 +182,7 @@ URL shapes that returned 200 with a `jobList`:
 
 ### 2. Same data in the browser (when you are already driving a tab)
 
-The in-memory `self.__next_f` array is emptied after hydration (length 0 observed), but the inline `<script>` tags stay in the DOM, so read those.
+The in-memory `self.__next_f` array is emptied after hydration (length 0 observed), but the inline `<script>` tags stay in the DOM, so read those. This runs in the attached tab in the background; it never calls `activate_tab`.
 
 ```python
 import json, time, urllib.parse
@@ -148,6 +193,8 @@ def search_url(keyword=None, location=None, page=1):
         parts.append("q-" + urllib.parse.quote_plus(keyword.replace("-", " ").strip()))
     if location:
         parts.append("l-" + urllib.parse.quote_plus(location.replace("-", " ").strip()))
+    if not parts:
+        raise ValueError("need a keyword or a location")
     url = "https://www.dice.com/jobs/" + "-".join(parts) + "-jobs"
     return url if page == 1 else f"{url}?page={page}"
 
@@ -162,17 +209,26 @@ READ_JOBLIST = r"""(()=>{
   return i < 0 ? null : f.slice(i + 10);
 })()"""
 
+IS_CHALLENGE = r"""(()=>!!document.querySelector(
+  'script[src*="challenge-platform"],#px-captcha,iframe[src*="captcha"],.g-recaptcha,.h-captcha')
+  || /^(Access Denied|Just a moment|Attention Required)/i.test(document.title))()"""
+
 def open_page(url, first=False):
     new_tab(url) if first else goto_url(url)
     wait_for_load()
-    for _ in range(20):                      # confirm we are on the requested page
+    for _ in range(20):                      # confirm we are on the requested page (incl. query)
         if js("location.href") == url:
-            return
+            break
         time.sleep(0.5)
-    raise RuntimeError(f"expected {url}, got {js('location.href')}")
+    else:
+        raise RuntimeError(f"expected {url}, got {js('location.href')}")
+    if js(IS_CHALLENGE):
+        raise RuntimeError(f"challenge/block page at {url} - stop and tell the user, do not retry")
 
 def browser_search(keyword=None, location=None, max_pages=2):
-    rows, seen, meta = [], set(), {}
+    if max_pages < 1:
+        raise ValueError("max_pages must be >= 1")
+    rows, seen, meta, page, reason = [], set(), {}, 0, None
     for page in range(1, min(max_pages, 25) + 1):
         if page > 1:
             time.sleep(2)
@@ -181,23 +237,39 @@ def browser_search(keyword=None, location=None, max_pages=2):
         if not raw:
             raise RuntimeError("no jobList on page - stop and inspect (layout change or block page)")
         jl = json.JSONDecoder().raw_decode(raw)[0]
-        meta = jl.get("meta") or {}
-        if meta.get("currentPage") != page:
+        meta, data = jl.get("meta") or {}, jl.get("data")
+        if not isinstance(data, list) or any(not isinstance(meta.get(k), int)
+                                             for k in ("currentPage", "pageCount", "totalResults")):
+            raise RuntimeError("jobList without data/meta counts - layout change, stop")
+        if any(not (j.get("guid") and j.get("title") and j.get("detailsPageUrl")) for j in data):
+            raise RuntimeError("job without guid/title/detailsPageUrl - layout change, stop")
+        if meta["currentPage"] != page:
+            reason = f"asked for page {page}, Dice returned page {meta['currentPage']}"
+            page -= 1
             break
-        for j in jl.get("data") or []:
-            if j.get("guid") in seen:
+        for j in data:
+            if j["guid"] in seen:
                 continue
-            seen.add(j.get("guid"))
+            seen.add(j["guid"])
             loc = j.get("jobLocation") or {}
-            rows.append({"title": j.get("title"), "company": j.get("companyName"),
+            rows.append({"title": j["title"], "company": j.get("companyName"),
                          "location": loc.get("displayName"), "employment_type": j.get("employmentType"),
-                         "posted": j.get("postedDate"), "url": j.get("detailsPageUrl")})
-        if page >= (meta.get("pageCount") or 0):
+                         "posted": j.get("postedDate"), "url": j["detailsPageUrl"]})
+        if page >= meta["pageCount"]:
             break
-    return rows, meta.get("totalResults")
+    total = meta.get("totalResults", 0)
+    if len(rows) >= total:
+        status, reason = "complete", None
+    else:
+        status = "partial"
+        if reason is None and meta["pageCount"] > page:
+            reason = "Dice 25-page cap" if page == 25 else f"max_pages={max_pages} reached"
+        reason = reason or "relevance order reshuffled between pages (repeats/skips)"
+    return rows, {"status": status, "reason": reason, "total": total,
+                  "pages_fetched": page, "collected": len(rows)}
 
-rows, total = browser_search("DevOps Engineer", "Remote", max_pages=2)
-print(f"total={total} collected={len(rows)}")
+rows, info = browser_search("DevOps Engineer", "Remote", max_pages=2)
+print(info)
 for r in rows[:3]:
     print(json.dumps(r))
 ```
@@ -205,54 +277,92 @@ for r in rows[:3]:
 Output observed (trimmed):
 
 ```
-total=1585 collected=38
+{'status': 'partial', 'reason': 'max_pages=2 reached', 'total': 1587, 'pages_fetched': 2, 'collected': 35}
 {"title": "DevOps Engineer", "company": "Dexian DISYS", "location": "Charlotte, North Carolina, USA", "employment_type": "Contract", "posted": "2026-10-15T20:11:32Z", "url": "https://www.dice.com/job-detail/be07b58c-3595-4790-a5c4-fed0892f9c8c"}
-{"title": "DevOps Engineer", "company": "TechNix LLC", "location": "Raleigh, North Carolina, USA", "employment_type": "Contract, Third Party", ...}
+{"title": "DEVOPS ENGINEER", "company": "AaraTechnologies Inc", "location": "Maryland City, Maryland, USA", "employment_type": "Contract", ...}
 ```
 
-Not 40: across two runs this collected 38 and then 28 unique jobs, because the relevance order reshuffles between requests and page 2 repeats some page-1 jobs. See "Unstable order" under Gotchas.
+Not 40: across runs this collected 38, 28 (2026-10-23) and 35 (2026-10-24) unique jobs, because the relevance order reshuffles between requests and page 2 repeats some page-1 jobs. See "Unstable order" under Gotchas.
 
 DOM fallback if the JSON ever disappears: each result is `[data-testid="job-card"][role="article"]` inside `role="list"` with `aria-label="Job search results"`; the card link `a[data-testid="job-search-job-card-link"]` has `href="/job-detail/<guid>"` and `aria-label="View Details for <title> (<id>)"`. Card text only has relative dates ("Yesterday", "2d ago"), so prefer the JSON.
 
 ### 3. Job detail via JSON-LD (description, expiry, postal address)
 
+Self-contained. Returns `None` only for Dice's own "Job Not Found" page (what an unknown or removed guid returned: HTTP 200, `<title>Job Not Found | Dice.com</title>`, no JSON-LD). Any other page without a valid `JobPosting` raises, so a challenge or block page is never mistaken for an expired posting.
+
 ```python
-import json, re, urllib.request
+import http.client, json, re, time, urllib.error, urllib.request
 
 UA = "dice-jobs-research/1.0 (python-urllib; personal job search script)"
+DELAYS = (5, 15, 40)
+CHALLENGE = re.compile(r"cf-chl|/cdn-cgi/challenge-platform|px-captcha|captcha-delivery\.com|"
+                       r"_Incapsula_Resource|g-recaptcha|h-captcha|"
+                       r"<title>\s*(?:Access Denied|Just a moment|Attention Required)", re.I)
+
+def fetch(url, attempts=4, deadline_s=120):
+    """Same contract as section 1: one deadline, bounded retries, raise on challenge."""
+    if not 1 <= attempts <= len(DELAYS) + 1 or not 0 < deadline_s <= 120:
+        raise ValueError("attempts must be 1..4 and deadline_s in (0, 120]")
+    end = time.monotonic() + deadline_s
+    for i in range(attempts):
+        left = end - time.monotonic()
+        if left <= 0:
+            raise TimeoutError(f"{deadline_s}s deadline used up for {url}")
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "text/html"})
+            with urllib.request.urlopen(req, timeout=min(30, left)) as r:
+                final, html = r.geturl(), r.read().decode("utf-8")
+        except urllib.error.HTTPError as e:
+            if e.code not in (429, 500, 502, 503, 504) or i == attempts - 1:
+                raise
+        except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.HTTPException):
+            if i == attempts - 1:
+                raise
+        else:
+            if final != url:
+                raise RuntimeError(f"redirected to {final}")
+            if CHALLENGE.search(html):
+                raise RuntimeError(f"challenge/block page at {url} - stop, do not retry")
+            return html
+        if time.monotonic() + DELAYS[i] >= end:
+            raise TimeoutError(f"{deadline_s}s deadline reached for {url} after {i + 1} attempts")
+        time.sleep(DELAYS[i])
 
 def job_detail(detail_url):
-    req = urllib.request.Request(detail_url, headers={"User-Agent": UA, "Accept": "text/html"})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        if r.geturl() != detail_url:
-            raise RuntimeError(f"redirected to {r.geturl()}")
-        html = r.read().decode("utf-8")
+    html = fetch(detail_url)
     for block in re.findall(r'<script[^>]*application/ld\+json[^>]*>(.*?)</script>', html, re.S):
         d = json.loads(block)
         if isinstance(d, dict) and d.get("@type") == "JobPosting":
+            missing = [k for k in ("title", "datePosted", "hiringOrganization", "description") if not d.get(k)]
+            if missing:
+                raise RuntimeError(f"JobPosting missing {missing} at {detail_url} - stop and inspect")
             return d
-    return None   # expired or removed postings may not carry JSON-LD
+    if re.search(r"<title>Job Not Found \| Dice\.com</title>", html):
+        return None
+    raise RuntimeError(f"no JobPosting JSON-LD and not a Job Not Found page at {detail_url} - stop and inspect")
 
 # Take a fresh URL from a search page so this does not depend on one posting staying live.
-search = "https://www.dice.com/jobs/q-Python+Developer-jobs"
-with urllib.request.urlopen(urllib.request.Request(search, headers={"User-Agent": UA}), timeout=30) as r:
-    first = re.search(r'href="(/job-detail/[0-9a-f-]{36})"', r.read().decode("utf-8"))
+first = re.search(r'href="(/job-detail/[0-9a-f-]{36})"', fetch("https://www.dice.com/jobs/q-Python+Developer-jobs"))
 if not first:
     raise RuntimeError("no job-detail link on the search page")
 jp = job_detail("https://www.dice.com" + first.group(1))
-if jp:
-    addr = (jp.get("jobLocation") or {}).get("address") or {}
-    print(jp["title"], "|", (jp.get("hiringOrganization") or {}).get("name"), "|", jp.get("employmentType"),
-          "|", jp.get("datePosted"), "|", jp.get("validThrough"), "|", addr.get("addressLocality"), addr.get("addressRegion"))
-    print(len(jp.get("description") or ""), "chars of description HTML")
+if jp is None:
+    print("posting is gone (Job Not Found)")
 else:
-    print("no JobPosting JSON-LD on that page")
+    addr = (jp.get("jobLocation") or {}).get("address") or {}
+    print(jp["title"], "|", jp["hiringOrganization"].get("name"), "|", jp.get("employmentType"),
+          "|", jp["datePosted"], "|", jp.get("validThrough"), "|", addr.get("addressLocality"), addr.get("addressRegion"))
+    print(len(jp["description"]), "chars of description HTML")
+
+print(job_detail("https://www.dice.com/job-detail/00000000-0000-0000-0000-000000000000"))  # unknown guid
 ```
 
 Output observed (trimmed):
 
 ```
 Equity Derivatives Python Developer - New York - COntract | SANS | CONTRACTOR | 2026-10-22T21:49:51.000Z | 2026-11-23T18:06:44.000Z | New York NY
+7726 chars of description HTML
+None
 ```
 
 JSON-LD keys seen: `title, datePosted, validThrough, employmentType, hiringOrganization{name,sameAs,logo}, jobLocation{address{addressLocality,addressRegion,postalCode,addressCountry}}, baseSalary, description, identifier, applicantLocationRequirements, url`. Note `employmentType` here is the schema.org enum (`CONTRACTOR`), not the search-card label (`Contract`).
@@ -282,14 +392,14 @@ JSON-LD keys seen: `title, datePosted, validThrough, employmentType, hiringOrgan
 - Use the `/jobs/q-...-jobs` path, not the `/jobs?q=...` query form: robots.txt disallows `/jobs?q*`.
 - Hyphens split the path: `q-Front-End+Developer-jobs` was read as "Front" (top hits were "Front Office ..." and "Front Desk ..."). Replace hyphens with spaces first; `q-Front+End+Developer-jobs` returned real front-end roles. `Winston-Salem, NC` as `Winston+Salem%2C+NC` still resolved to "Winston-Salem, NC, USA".
 - URL-encode with `quote_plus`: `C#` must be `C%23` (`/jobs/q-C%23+Developer-jobs` worked), commas become `%2C`.
-- 25-page clamp: any `page` above 25 silently returns page 25, so compare `meta.currentPage` to the page you asked for. `pageCount` can exceed 25 (46 for "Python Developer"); 500 jobs is the per-search ceiling. Do not split one search into many slices to get around it.
+- 25-page clamp: any `page` above 25 silently returns page 25, so compare `meta.currentPage` to the page you asked for. `pageCount` can exceed 25 (46 for "Python Developer"); 500 jobs is the per-search ceiling. Treat it as a hard stop (`search_dice` returns `status: "partial"`, reason `Dice 25-page cap`); do not split one search into many slices or reshape the query to get around it.
 - `pageSize` query param is ignored; always 20 per page. `page=0` returns page 1.
-- Unstable order: results are always sorted by `relevance` and the order reshuffles between requests, so consecutive pages repeat some jobs and skip others. Unique jobs over pages 1-5 (100 slots) measured on 2026-10-23: "Python Developer" 99, "Data Engineer" in Chicago 91, "DevOps Engineer" 89, "DevOps Engineer" + `l-Remote` 78. Reloading the same page 2 returned only 8 of the same 20 jobs. Small result sets came back complete (Houston "Python Developer": 132 of 132 over 7 pages). `sortBy=date`, `sort=date`, `sortBy=postedDate` were all ignored (`meta.sortBy` stayed `relevance`). Always de-dup on `guid` and report `len(jobs)` against `totalResults` instead of assuming full coverage.
+- Unstable order: results are always sorted by `relevance` and the order reshuffles between requests, so consecutive pages repeat some jobs and skip others. Unique jobs over pages 1-5 (100 slots) measured on 2026-10-23: "Python Developer" 99, "Data Engineer" in Chicago 91, "DevOps Engineer" 89, "DevOps Engineer" + `l-Remote` 78. Reloading the same page 2 returned only 8 of the same 20 jobs. Small result sets came back nearly or fully complete (Houston "Python Developer": 132 of 132 over 7 pages on 2026-10-23, 131 of 132 on 2026-10-24). `sortBy=date`, `sort=date`, `sortBy=postedDate` were all ignored (`meta.sortBy` stayed `relevance`). Always de-dup on `guid` and report `len(jobs)` against `totalResults` instead of assuming full coverage.
 - The same title can be posted twice under different `guid`s (seen for one recruiter); those are separate postings, keep both.
 - `l-Remote` does not filter to remote jobs (top hits were On-Site); use `filters.workplaceTypes=Remote`.
 - Counts drift between requests (918 vs 919 total within minutes) because postings update continuously.
 - No cookie/consent banner appeared on these pages in the cloud browser (US). No region redirect seen.
-- Polite pacing: 2 s between pages was used for the whole run without any 429. On 403, 429 or a page without `jobList`, stop and back off rather than retrying aggressively.
+- Polite pacing: 2 s between pages was used for the whole run without any 429. `fetch` retries 429/5xx and network errors only inside one 120 s deadline; a 403, a challenge page or a page without `jobList` raises at once. Stop there and tell the user; do not retry around it or change the User-Agent.
 
 ## What does not work / not used
 

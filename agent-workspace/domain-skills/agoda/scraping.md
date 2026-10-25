@@ -8,8 +8,8 @@ robots.txt (fetched 2026-10-24) allows `/search`, `/city/<slug>.html` and `/<slu
 
 - Plain HTTP GET of `/search?...` and of a hotel page returns HTTP 200 with a JavaScript shell (about 430 KB and 340 KB): empty `<title>`, no hotel names, no filled JSON-LD. You need a real browser for results and hotel data.
 - Plain HTTP GET of a city landing page (`/city/bangkok-th.html`, about 87 KB) does contain the numeric city id in `"defaultSearchURL":"/search?city=9395..."`. Use that to build search URLs without the autocomplete widget.
-- In the browser, each result is an `li[data-selenium="hotel-item"]` with `data-hotelid`. Name, star rating, review score and count (from an ARIA label or screen-reader text), nightly price and URL are all on the card. 98 cards per page in this run; 3 pages gave 294 properties. The same hotel can appear on two pages, so block 2 dedupes by `hotel_id`.
-- Cards are virtualized: only the ones near the viewport have content, so scroll and merge by `data-hotelid`. In a hidden background tab they never render; activate the tab.
+- In the browser, each result is an `li[data-selenium="hotel-item"]` with `data-hotelid`. Name, star rating, review score and count (from an ARIA label or screen-reader text), nightly price and URL are all on the card. 98 cards per page in this run; 3 pages gave 294 cards and 289 unique properties. The same hotel can appear on two pages (5 did here), so block 2 dedupes by `hotel_id`.
+- Cards are virtualized: only the ones near the viewport have content, so scroll and merge by `data-hotelid`. In a hidden background tab they never render, so block 2 raises unless you opt in to `FOREGROUND = True`.
 - Pagination is a Next button; the URL does not change between pages.
 - Hotel pages carry `<script type="application/ld+json">` of `@type: Hotel` (name, address, postal code, aggregateRating, image, description, map center) plus rendered blocks for stars, live review count, top amenities and the "from USD x" price.
 
@@ -17,7 +17,7 @@ robots.txt (fetched 2026-10-24) allows `/search`, `/city/<slug>.html` and `/<slu
 
 ### 1. City slug -> city id (plain HTTP, no browser)
 
-City slugs are the `/city/<slug>.html` landing pages, for example `bangkok-th`, `tokyo-jp`. An unknown slug answers `302` to a page that returns `404`, so `city_id` raises `HTTPError 404`.
+City slugs are the `/city/<slug>.html` landing pages, for example `bangkok-th`, `tokyo-jp`. An unknown slug answers `302` to a page that returns `404`, so `city_id` raises `HTTPError 404`. Only 5xx answers are retried, all inside one 120 s deadline; 403 and 429 raise at once.
 
 ```python
 import json, re, time, urllib.error, urllib.request
@@ -27,17 +27,17 @@ UA = "agoda-city-id-lookup/1.0 (python-urllib)"   # honest client name, no brows
 def city_id(slug):
     """slug like 'bangkok-th' or 'tokyo-jp' (the /city/<slug>.html landing page)."""
     url = f"https://www.agoda.com/city/{slug}.html"
-    deadline, delay = time.time() + 120, 5
+    deadline, delay = time.time() + 120, 5        # one deadline for every attempt and backoff
     while True:
         try:
             req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept-Language": "en-US"})
-            with urllib.request.urlopen(req, timeout=30) as r:
+            with urllib.request.urlopen(req, timeout=max(1, min(30, deadline - time.time()))) as r:
                 if r.geturl() != url:
                     raise ValueError(f"{url} redirected to {r.geturl()} - unknown city slug?")
                 html = r.read().decode("utf-8", "replace")
             break
-        except urllib.error.HTTPError as e:
-            if e.code not in (429, 500, 502, 503, 504) or time.time() + delay > deadline:
+        except urllib.error.HTTPError as e:      # 403/429 = blocked or rate limited: stop, do not retry
+            if e.code not in (500, 502, 503, 504) or time.time() + delay + 1 > deadline:
                 raise
             time.sleep(delay); delay *= 2
     m = re.search(r'"defaultSearchURL":"/search\?city=(\d+)', html)
@@ -59,13 +59,14 @@ tokyo-jp 5085
 
 ### 2. Search results for a city and dates, several pages (browser)
 
-Builds the search URL with `urllib.parse.urlencode`, opens it, scrolls each page until every card has rendered, then clicks Next. `price` is the per-night price before taxes in `currency`, for the dates in the URL.
+Builds the search URL with `urllib.parse.urlencode`, opens it, waits until the tab shows that URL (all requested parameters intact), scrolls each page until every card has rendered with its required fields, then clicks Next. `price` is the per-night price before taxes in `currency`, for the dates in the URL. `PAGES` is a cap: when more pages exist the run prints `PARTIAL` and saves `"complete": false`. A challenge or block page raises at once and is never retried. Run it in a dedicated browser: if the tab opened hidden, the block raises unless you set `FOREGROUND = True`, which brings the tab to the front of that Chrome window.
 
 ```python
-import datetime, json, time, urllib.parse
+import datetime, json, re, time, urllib.parse
 
-CITY_ID = 9395   # Bangkok; get others with city_id("tokyo-jp") from the block above
-PAGES = 3        # each results page holds ~100 properties
+CITY_ID = 9395       # Bangkok; get others with city_id("tokyo-jp") from the block above
+PAGES = 3            # page cap; each results page holds ~100 properties
+FOREGROUND = False   # opt-in: True may bring this tab to the front (visible to whoever uses that Chrome)
 check_in = (datetime.date.today() + datetime.timedelta(days=30)).isoformat()
 params = {"city": CITY_ID, "checkIn": check_in, "los": 2, "rooms": 1, "adults": 2,
           "children": 0, "locale": "en-us", "currency": "USD"}
@@ -74,27 +75,31 @@ SEARCH_URL = "https://www.agoda.com/search?" + urllib.parse.urlencode(params)
 CARDS = r"""
 JSON.stringify([...document.querySelectorAll('li[data-selenium="hotel-item"]')].map(li => {
   const q = s => li.querySelector(s);
+  const id = li.getAttribute('data-hotelid');
   const a = q('a[data-selenium="hotel-name"]');
-  if (!a) return {id: li.getAttribute('data-hotelid'), empty: true};   // virtualized, not rendered yet
+  const name = a ? a.innerText.trim() : '', href = a ? a.getAttribute('href') : null;
+  const price = q('[data-selenium="display-price"]');
+  const sold_out = /Sold out on your dates/i.test(li.innerText);
+  // virtualized: a card counts only once id, name, url and (price or sold-out note) are all there
+  if (!id || !name || !href || (!price && !sold_out)) return {id, empty: true};
   const star = q('[data-testid="rating-container"]');
   const sm = star && star.innerText.match(/([\d.]+) stars? out of 5/);
   // two layouts seen: data-element-name + aria-label, or data-testid + screen-reader text
   const rev = q('[data-element-name="property-card-review"],[data-testid="property-card-review"]');
   const rm = rev && ((rev.getAttribute('aria-label') || '') + ' ' + rev.innerText)
     .match(/([\d.]+) out of 10 with ([\d,]+) review/);
-  const price = q('[data-selenium="display-price"]');
   // two href forms seen: /<slug>/hotel/<city>.html?... and /accom/property?propertyId=<id>&...
-  const u = new URL(a.getAttribute('href'), location.origin);
+  const u = new URL(href, location.origin);
   const pid = u.searchParams.get('propertyId');
   return {
-    hotel_id: li.getAttribute('data-hotelid'),
-    name: a.innerText.trim(),
+    hotel_id: id,
+    name,
     stars: sm ? parseFloat(sm[1]) : null,
     review_score: rm ? parseFloat(rm[1]) : null,
     review_count: rm ? parseInt(rm[2].replace(/,/g, '')) : null,
     price: price ? parseFloat(price.innerText.replace(/,/g, '')) : null,
     currency: q('[data-selenium="hotel-currency"]')?.innerText || null,
-    sold_out: /Sold out on your dates/i.test(li.innerText),
+    sold_out,
     promoted: /\bPromoted\b/.test(li.innerText),
     area: q('[data-selenium="area-city-text"]')?.innerText || null,
     url: u.pathname === '/accom/property' && pid ? u.origin + u.pathname + '?propertyId=' + pid
@@ -102,6 +107,16 @@ JSON.stringify([...document.querySelectorAll('li[data-selenium="hotel-item"]')].
   };
 }))
 """
+
+# Generic block-page markers. No challenge was seen on Agoda in these runs, so these are not Agoda-specific.
+CHALLENGE = r"""
+(() => {
+  const text = (document.title + ' ' + (document.body ? document.body.innerText : '')).slice(0, 20000);
+  return /captcha|are you a robot|verify (that )?you are (a )?human|unusual traffic|access denied|request blocked|pardon our interruption/i.test(text)
+    || !!document.querySelector('iframe[src*="captcha"], iframe[src*="challenge"], #px-captcha, .g-recaptcha, .h-captcha');
+})()
+"""
+LABEL = "document.querySelector('[data-selenium=\"pagination-text\"]')?.innerText || ''"
 
 def try_js(expr, default=None):
     """Agoda pages can block the main thread for several seconds; evaluate then times out.
@@ -111,39 +126,60 @@ def try_js(expr, default=None):
     except RuntimeError:
         return default
 
-def page_label():
-    return js("document.querySelector('[data-selenium=\"pagination-text\"]')?.innerText || ''")
+def check_challenge():
+    if try_js(CHALLENGE):
+        raise RuntimeError(f"challenge or block page at {try_js('location.href')}: stop here, do not retry")
+
+def on_requested_url(href, url):
+    """Agoda appends ds=... and sort=...; every parameter we asked for must still be there unchanged."""
+    want, got = urllib.parse.urlsplit(url), urllib.parse.urlsplit(href or "")
+    got_q = dict(urllib.parse.parse_qsl(got.query))
+    return (got.netloc, got.path) == (want.netloc, want.path) and \
+        all(got_q.get(k) == v for k, v in urllib.parse.parse_qsl(want.query))
+
+def page_numbers(label):
+    m = re.fullmatch(r"Page (\d+) of (\d+)", (label or "").strip())
+    return (int(m[1]), int(m[2])) if m else None
 
 def wait_for_cards(timeout=60):
-    deadline = time.time() + timeout
-    href = None
+    deadline, href = time.time() + timeout, None
     while time.time() < deadline:
+        check_challenge()
         href = try_js("location.href") or href
-        if href and href.startswith("https://www.agoda.com/search") and \
+        if on_requested_url(href, SEARCH_URL) and \
                 try_js("document.querySelector('li[data-selenium=hotel-item] a[data-selenium=hotel-name]') !== null"):
             return
         time.sleep(1)
-    raise RuntimeError(f"no hotel cards after {timeout}s; last location {href}")
+    text = try_js("document.body.innerText.replace(/\\s+/g, ' ').trim().slice(0, 120)")
+    raise RuntimeError(f"no hotel cards for the requested search after {timeout}s; at {href}; page text {text!r}")
 
-def harvest_page(attempts=3):
+def harvest_page(timeout=120):
     """Cards are virtualized: only ones near the viewport have content. Scroll and merge by id.
-    If ids seen earlier are no longer in the DOM, the list was replaced under us: start the page over."""
-    for attempt in range(attempts):
-        rows, missing, gone = harvest_once()
+    If ids seen earlier are no longer in the DOM, the list was replaced under us: start the page over.
+    One deadline covers every attempt; a challenge or the deadline raises, never a partial page."""
+    deadline, attempt = time.time() + timeout, 1
+    while True:
+        check_challenge()
+        rows, missing, gone = harvest_once(deadline)
         if not missing:
             return rows
-        print(f"  {len(missing)} cards missing ({len(gone)} no longer in the DOM), attempt {attempt + 1}")
-        if not gone:
-            break
-        if attempt + 1 < attempts:               # no sleep after the last attempt
-            time.sleep(3)
-    raise RuntimeError(f"{len(missing)} cards never rendered: {missing[:5]}, visibility={js('document.visibilityState')}")
+        print(f"  {len(missing)} cards missing ({len(gone)} no longer in the DOM), attempt {attempt}")
+        if not gone or time.time() + 3 >= deadline:   # no sleep after the last attempt
+            raise RuntimeError(f"{len(missing)} cards never rendered: {missing[:5]}, "
+                               f"visibility={try_js('document.visibilityState')}")
+        time.sleep(3); attempt += 1
 
-def harvest_once():
+def harvest_once(deadline):
     rows, order = {}, []
     def collect():
-        for r in json.loads(js(CARDS)):
+        cards = json.loads(js(CARDS))
+        if not cards:
+            check_challenge()
+            raise RuntimeError(f"no result cards on {try_js('location.href')}")
+        for r in cards:
             hid = r.get("hotel_id") or r.get("id")
+            if not hid:
+                raise RuntimeError("result card without data-hotelid: markup changed?")
             if hid not in rows:
                 order.append(hid); rows[hid] = None
             if not r.get("empty"):
@@ -151,58 +187,66 @@ def harvest_once():
     js("window.scrollTo(0, 0)"); time.sleep(1)
     bottom_hits = 0
     while bottom_hits < 3:                       # 3 checks at the bottom = lazy loading finished
+        if time.time() > deadline:
+            raise RuntimeError(f"page harvest passed its deadline at {len(order)} cards")
         collect()
         at_bottom = js("scrollY + innerHeight >= document.documentElement.scrollHeight - 5")
         bottom_hits = bottom_hits + 1 if at_bottom else 0
         js("window.scrollBy(0, 600)"); time.sleep(0.8)
     for hid in [h for h in order if rows[h] is None]:   # skipped or slow cards: visit each, wait up to 10 s
         js(f"document.querySelector('li[data-hotelid=\"{hid}\"]')?.scrollIntoView({{block: 'center'}})")
-        for _ in range(10):
+        card_deadline = min(deadline, time.time() + 10)
+        while rows[hid] is None and time.time() < card_deadline:
             time.sleep(1); collect()
-            if rows[hid] is not None:
-                break
     missing = [h for h in order if rows[h] is None]
     gone = [h for h in missing if not js(f"!!document.querySelector('li[data-hotelid=\"{h}\"]')")]
     return [rows[h] for h in order if rows[h] is not None], missing, gone
 
-def next_page():
-    before = page_label()
-    first = js("document.querySelector('li[data-selenium=\"hotel-item\"]')?.getAttribute('data-hotelid')")
+def next_page(cur):
+    """Click Next and wait until the label reads page cur + 1. Raises if there is no Next button."""
     js("document.querySelector('[data-selenium=\"pagination-next-btn\"]')?.scrollIntoView({block: 'center'})")
     time.sleep(1)
     box = js("(() => { const b = document.querySelector('[data-selenium=\"pagination-next-btn\"]'); "
              "if (!b) return null; const r = b.getBoundingClientRect(); return [r.x + r.width/2, r.y + r.height/2]; })()")
     if not box:
-        return False                              # last page
+        raise RuntimeError(f"no Next button on page {cur} (label {try_js(LABEL)!r})")
     click_at_xy(*box)
     deadline = time.time() + 60
     while time.time() < deadline:
         time.sleep(1)
-        now = js("document.querySelector('li[data-selenium=\"hotel-item\"]')?.getAttribute('data-hotelid')")
-        if page_label() != before and now and now != first:
-            wait_for_cards(); return True
-    raise RuntimeError(f"page did not advance from {before!r}")
+        check_challenge()
+        nums = page_numbers(try_js(LABEL))
+        if nums and nums[0] == cur + 1:
+            wait_for_cards(); return nums
+    raise RuntimeError(f"page did not advance from {cur} (label {try_js(LABEL)!r})")
 
 new_tab(SEARCH_URL)
-activate_tab(current_tab())    # a hidden background tab never renders the lazy cards
 wait_for_cards()
-if js("document.visibilityState") != "visible":
-    raise RuntimeError("tab is hidden; cards will not render")
+if js("document.visibilityState") != "visible":   # hidden tabs never render the lazy cards
+    if not FOREGROUND:
+        raise RuntimeError("tab is hidden, so cards will not render: use a dedicated browser "
+                           "or set FOREGROUND = True to bring this tab to the front")
+    activate_tab(current_tab())
 print("search:", js("location.href"))
+nums = page_numbers(try_js(LABEL))
+if not nums:
+    raise RuntimeError(f"unexpected pagination label {try_js(LABEL)!r}")
+cur, total = nums
 results, seen, dupes = [], set(), 0
-for p in range(PAGES):
-    label = page_label()
+while True:
     rows = harvest_page()
-    print(f"{label}: {len(rows)} properties")
+    print(f"Page {cur} of {total}: {len(rows)} properties")
     for r in rows:                                # the same hotel can show on two pages; keep the first
         if r["hotel_id"] in seen:
             dupes += 1; continue
-        seen.add(r["hotel_id"]); results.append(dict(r, page=p + 1))
-    if p + 1 < PAGES:
-        time.sleep(3)                             # polite pacing between pages
-        if not next_page():
-            break
+        seen.add(r["hotel_id"]); results.append(dict(r, page=cur))
+    if cur >= total or cur >= PAGES:
+        break
+    time.sleep(3)                                 # polite pacing between pages
+    cur, total = next_page(cur)
 
+status = {"complete": cur >= total, "pages_read": cur, "pages_total": total,
+          "search_url": SEARCH_URL, "params": params}
 print("unique", len(results), "duplicates dropped", dupes)
 for r in results[:3]:
     print(r)
@@ -210,25 +254,28 @@ print("sold_out", sum(r["sold_out"] for r in results), "promoted", sum(r["promot
       "no price", sum(r["price"] is None for r in results),
       "no stars", sum(r["stars"] is None for r in results),
       "no review score", sum(r["review_score"] is None for r in results))
-json.dump(results, open("agoda_results.json", "w"), indent=1, ensure_ascii=False)
+if not status["complete"]:
+    print(f"PARTIAL: stopped at the PAGES = {PAGES} cap on page {cur} of {total}; more results exist")
+json.dump(dict(status, results=results), open("agoda_results.json", "w"), indent=1, ensure_ascii=False)
 ```
 
 Output on 2026-10-24, so `checkIn` is 2026-11-23 (trimmed):
 
 ```
-search: https://www.agoda.com/search?city=9395&checkIn=2026-11-23&los=2&rooms=1&adults=2&children=0&locale=en-us&currency=USD&ds=BVodqWThFjONcM7h
+search: https://www.agoda.com/search?city=9395&checkIn=2026-11-23&los=2&rooms=1&adults=2&children=0&locale=en-us&currency=USD&ds=khPQ2nGciYo%2FA3Fz
 Page 1 of 75: 98 properties
 Page 2 of 75: 98 properties
 Page 3 of 75: 98 properties
-unique 294 duplicates dropped 0
-{'hotel_id': '3552260', 'name': 'Akara Hotel Bangkok', 'stars': 5, 'review_score': 8.6, 'review_count': 10532, 'price': 77, 'currency': 'USD', 'sold_out': False, 'promoted': False, 'area': 'Pratunam, Bangkok - City center', 'url': 'https://www.agoda.com/akara-hotel-bangkok/hotel/bangkok-th.html', 'page': 1}
+unique 289 duplicates dropped 5
+{'hotel_id': '51238093', 'name': 'Maison Hotel Bangkok', 'stars': 5, 'review_score': 8.9, 'review_count': 9458, 'price': 72, 'currency': 'USD', 'sold_out': False, 'promoted': False, 'area': 'Sukhumvit, Bangkok - City center', 'url': 'https://www.agoda.com/accom/property?propertyId=51238093', 'page': 1}
 ...
 sold_out 24 promoted 4 no price 24 no stars 0 no review score 0
+PARTIAL: stopped at the PAGES = 3 cap on page 3 of 75; more results exist
 ```
 
 ### 3. Hotel page basics (browser)
 
-Run after block 2 in the same tab, or on its own. Uses JSON-LD for the stable fields and the rendered page for star rating, live review count, the "from" price and top amenities.
+Run after block 2 in the same tab, or on its own. Uses JSON-LD for the stable fields and the rendered page for star rating, live review count, the "from" price and top amenities. It reuses the tab only if that tab is already on agoda.com, confirms the tab shows the requested URL (path, `propertyId` and stay parameters) before reading, raises on a challenge, and needs a visible tab like block 2 (same `FOREGROUND` opt-in).
 
 ```python
 import datetime, json, re, time, urllib.parse
@@ -237,6 +284,7 @@ HOTEL_URLS = [   # any `url` values from the search rows
     "https://www.agoda.com/bless-residence/hotel/bangkok-th.html",
     "https://www.agoda.com/accom/property?propertyId=14654101",   # the other href form
 ]
+FOREGROUND = False   # opt-in: True may bring this tab to the front (visible to whoever uses that Chrome)
 check_in = (datetime.date.today() + datetime.timedelta(days=30)).isoformat()
 STAY = {"checkIn": check_in, "los": 2, "rooms": 1, "adults": 2, "currencyCode": "USD"}
 
@@ -251,6 +299,9 @@ HOTEL = r"""
   const from = (t('[data-element-name="cheapest-room-price-property-nav-bar"]') || '').match(/from ([A-Z]{3}) ([\d,.]+)/);
   const pid = new URLSearchParams(location.search).get('propertyId');
   const geo = (ld.hasMap || '').match(/center=([-\d.]+)%2c([-\d.]+)/i);
+  // free text: drop email addresses and phone-like numbers (9+ digits) before printing
+  const redact = s => s.replace(/[\w.+-]+@[\w-]+\.[\w.-]+/g, '[email]')
+    .replace(/\+?\d[\d ().-]{7,}\d/g, m => m.replace(/\D/g, '').length >= 9 ? '[phone]' : m);
   return JSON.stringify({
     jsonld_loaded: ld['@type'] === 'Hotel',   // the script tag exists empty at first, filled ~2 s later
     name: t('h1[data-selenium="hotel-header-name"]') || ld.name || null,
@@ -268,8 +319,17 @@ HOTEL = r"""
     from_price: from ? {currency: from[1], amount: parseFloat(from[2].replace(/,/g, ''))} : null,
     top_amenities: [...document.querySelectorAll('[data-element-name="atf-top-amenities-item"]')].map(e => e.innerText.trim()),
     image: ld.image ? new URL(ld.image, location.origin).href : null,
-    description: (ld.description || '').slice(0, 300),
+    description: redact(ld.description || '').slice(0, 300),
   });
+})()
+"""
+
+# Generic block-page markers. No challenge was seen on Agoda in these runs, so these are not Agoda-specific.
+CHALLENGE = r"""
+(() => {
+  const text = (document.title + ' ' + (document.body ? document.body.innerText : '')).slice(0, 20000);
+  return /captcha|are you a robot|verify (that )?you are (a )?human|unusual traffic|access denied|request blocked|pardon our interruption/i.test(text)
+    || !!document.querySelector('iframe[src*="captcha"], iframe[src*="challenge"], #px-captcha, .g-recaptcha, .h-captcha');
 })()
 """
 
@@ -281,28 +341,47 @@ def try_js(expr, default=None):
     except RuntimeError:
         return default
 
+def check_challenge():
+    if try_js(CHALLENGE):
+        raise RuntimeError(f"challenge or block page at {try_js('location.href')}: stop here, do not retry")
+
+def on_requested_url(href, url):
+    """Agoda appends ds=...; every parameter we asked for must still be there unchanged."""
+    want, got = urllib.parse.urlsplit(url), urllib.parse.urlsplit(href or "")
+    got_q = dict(urllib.parse.parse_qsl(got.query))
+    return (got.netloc, got.path) == (want.netloc, want.path) and \
+        all(got_q.get(k) == v for k, v in urllib.parse.parse_qsl(want.query))
+
 def open_hotel(url, timeout=90):
     u = urllib.parse.urlparse(url)
     query = dict(urllib.parse.parse_qsl(u.query), **STAY)
     target = u._replace(query=urllib.parse.urlencode(query)).geturl()
-    goto_url(target) if current_tab()["url"].startswith("http") else new_tab(target)
-    activate_tab(current_tab())
-    path, pid = u.path, query.get("propertyId")
+    if current_tab()["url"].startswith("https://www.agoda.com/"):
+        goto_url(target)                          # reuse this skill's own Agoda tab
+    else:
+        new_tab(target)                           # never navigate a tab that is on another site
     href, deadline = None, time.time() + timeout
     while time.time() < deadline:
+        check_challenge()
         href = try_js("location.href") or href
-        if href and urllib.parse.urlparse(href).path == path and (not pid or f"propertyId={pid}&" in href + "&") and \
+        if on_requested_url(href, target) and \
                 try_js("document.querySelector('h1[data-selenium=hotel-header-name]') !== null"):
-            return
+            break
         time.sleep(1)
-    raise RuntimeError(f"hotel page {path} not rendered after {timeout}s; last location {href}")
+    else:
+        raise RuntimeError(f"hotel page {target} not rendered after {timeout}s; last location {href}")
+    if js("document.visibilityState") != "visible":
+        if not FOREGROUND:
+            raise RuntimeError("tab is hidden: use a dedicated browser or set FOREGROUND = True")
+        activate_tab(current_tab())
 
 def read_hotel(timeout=60):
     d, deadline = None, time.time() + timeout
     while time.time() < deadline:
+        check_challenge()
         raw = try_js(HOTEL)
         d = json.loads(raw) if raw else d
-        if d and d["name"] and d["from_price"] and d["jsonld_loaded"]:
+        if d and d["name"] and d["url"] and d["from_price"] and d["jsonld_loaded"]:
             return d
         time.sleep(2)
     raise RuntimeError(f"incomplete hotel page at {try_js('location.href')}: {d} "
@@ -379,6 +458,9 @@ Search card (block 2):
 | `promoted` | card text `"Promoted"` (Agoda says it earns more commission on these) | `false` |
 | `area` | `[data-selenium="area-city-text"]` | `"Sukhumvit, Bangkok - City center"` |
 | `url` | `a[data-selenium="hotel-name"]` `href`, search parameters stripped | `https://www.agoda.com/bless-residence/hotel/bangkok-th.html` or `https://www.agoda.com/accom/property?propertyId=177997` |
+| `page` | results page the row was read from | `1` |
+
+A card is accepted only when `hotel_id`, `name`, `url` and either `price` or the sold-out note are present. `agoda_results.json` holds `complete`, `pages_read`, `pages_total`, `search_url`, `params` (the dates and party size) and `results` (the rows above).
 
 Hotel page (block 3):
 
@@ -396,15 +478,15 @@ Hotel page (block 3):
 | `from_price` | `[data-element-name="cheapest-room-price-property-nav-bar"]` text `"from USD 54"` | `{"currency": "USD", "amount": 54}` |
 | `top_amenities` | `[data-element-name="atf-top-amenities-item"]` | `["Free Wi-Fi", "Swimming pool", ...]` |
 | `image` | JSON-LD `image` (protocol-relative, made absolute) | `https://pix8.agoda.net/hotelImages/...` |
-| `description` | JSON-LD `description` | long marketing text |
+| `description` | JSON-LD `description`, first 300 characters, email addresses and phone-like numbers (9+ digits) replaced | long marketing text |
 
 ## Gotchas
 
 - **Cookie banner.** A "Manage Cookie Preference ... Dismiss" banner (`data-selenium="consent-banner"`) shows on every first load. It does not cover the results and the code above works without dismissing it.
-- **Hidden tab = no cards.** In a background tab (`document.visibilityState == "hidden"`) cards stayed as empty shells (only "<name> opens in a new tab"); in one run 7 of them never filled however far you scrolled. `activate_tab(current_tab())` fixed it.
+- **Hidden tab = no cards.** In a background tab (`document.visibilityState == "hidden"`) cards stayed as empty shells (only "<name> opens in a new tab"); in one run 7 of them never filled however far you scrolled. `activate_tab(current_tab())` fixed it, but it changes the visible tab, so blocks 2 and 3 only call it when you set `FOREGROUND = True` and raise otherwise. In a fresh cloud browser `new_tab` reused the one blank tab, which was already visible, so no activation was needed; with other tabs open, `new_tab` opens a background tab and the hidden-tab error fires (seen in this run).
 - **Virtualized list.** The page starts with 10 `li` elements, grows to 49 and then 98 while you scroll, and cards far from the viewport lose their inner content. Reading once after scrolling to the bottom gave only 44 filled cards out of 98. Collect on every scroll step and merge by `data-hotelid`; a final `scrollIntoView` pass picks up any card that was skipped.
-- **Pagination.** The first page said "Page 1 of 75" for a 2026-11-23 check-in and "Page 1 of 74" for 2026-11-30. Next is `[data-selenium="pagination-next-btn"]`; `location.href` stays the same (Agoda appends `ds=...` and `sort=agodaRecommended`), so you cannot deep-link to page N. Detect the page change from `[data-selenium="pagination-text"]` plus the first card id. Behaviour on the very last page was not tested; the code returns `False` if the button is gone and raises if the page does not advance.
-- **Prices depend on dates.** The same hotel page showed "from USD 54" for a 2026-11-23 check-in and "from USD 72" for 2026-11-30. Sold-out cards have no price block (24 of 294 in this run, all of them the cards with `price` None). Always keep `checkIn`, `los`, `adults`, `rooms` with the data.
+- **Pagination.** The first page said "Page 1 of 75" for a 2026-11-23 check-in and "Page 1 of 74" for 2026-11-30. Next is `[data-selenium="pagination-next-btn"]`; `location.href` stays the same (Agoda appends `ds=...` and `sort=agodaRecommended`), so you cannot deep-link to page N. Block 2 waits for that label to read page N+1; it does not require the first card to change, since a hotel can repeat across pages. It stops on its own only when the label says `Page N of N`. A missing Next button before that, or a page that does not advance within 60 s, raises. The last page itself was not reached in this run.
+- **Prices depend on dates.** The same hotel page showed "from USD 54" for a 2026-11-23 check-in and "from USD 72" for 2026-11-30. Sold-out cards have no price block (24 of 289 in this run, all of them the cards with `price` None). Always keep `checkIn`, `los`, `adults`, `rooms` with the data.
 - **Locale and currency.** Pass `locale=en-us&currency=USD` on search and `currencyCode=USD` on hotel pages; the regexes match English text ("stars out of 5", "reviews", "from USD").
 - **Review counts disagree.** JSON-LD `aggregateRating.reviewCount` lags the rendered count (12,409 vs 13,034 for the same hotel the same minute; 16,192 vs 17,767 for another). Use the rendered number if you want what users see.
 - **JSON-LD arrives late.** `script[data-selenium="bay-hotel-schema-json-ld"]` is in the DOM empty when the `h1` appears and is filled about 2 s later (0 then 23,163 characters). Reading too early returned `postal`, `lat`, `image` all `null`; block 3 waits for `jsonld_loaded`.
@@ -413,9 +495,10 @@ Hotel page (block 3):
 - **JSON-LD `hasMap`** is a Google Static Maps URL with Agoda's own key and signature in it. Parse only the `center=` coordinates; do not store or reuse the URL.
 - **Slow main thread.** With three Agoda tabs open, `Runtime.evaluate` (and so `js(...)` and `wait_for_load()`) timed out after 5 s on a loading hotel page. The `try_js` wrapper retries until the overall deadline. Keep one Agoda tab open.
 - **Card layouts vary between sessions.** Sessions on the same day got different card markup. Review block: either `data-element-name="property-card-review"` with the score in `aria-label`, or `data-testid="property-card-review"` with no `aria-label` and the same sentence as screen-reader text (code that only read the `aria-label` lost 285 of 294 scores). Hotel link: either `/<slug>/hotel/<city>.html?...` or `/accom/property?propertyId=<id>&...`; both open the same hotel page. Block 2 handles all of these.
-- **List replaced after load.** In one run with a visible tab, 13 ids collected early never got content (the run failed loudly); Agoda also rewrites the URL after load (adds `ds=...` or `sort=agodaRecommended`). Block 2 checks whether the unfilled ids are still in the DOM and, if they are gone, harvests the page again (up to 3 times) instead of returning a partial page. The cause was not pinned down.
+- **List replaced after load.** In one run with a visible tab, 13 ids collected early never got content (the run failed loudly); Agoda also rewrites the URL after load (adds `ds=...` or `sort=agodaRecommended`). Block 2 checks whether the unfilled ids are still in the DOM and, if they are gone and no challenge is showing, harvests the page again; all attempts share one 120 s deadline and it raises rather than return a partial page. The cause was not pinned down.
 - **Selectors.** Agoda's CSS class names are generated (`afab5-...`, `sc-...`); the `data-selenium`, `data-testid`, `data-element-name` and `aria-label` hooks used here matched in every layout seen in this run.
-- **Pacing.** Three result pages plus a handful of hotel pages, with 3 s between page loads, met no CAPTCHA, block page or HTTP 429. No published rate limit was found. Keep at least that pause; if a page ever stops showing cards or shows a challenge, stop and back off rather than retrying.
+- **Stuck loading modal.** In one fresh cloud browser the search page sat on Agoda's "Just a moment! We're finding great stays for your dates and destination." modal for over 2 minutes with 0 cards; its script bundles from `cdn6.agoda.net` never loaded (resource status 0). The next fresh browser showed cards after 13 s. `wait_for_cards` raises after 60 s and prints the page text; do not loop on it.
+- **Pacing and challenges.** Three result pages plus a handful of hotel pages, with 3 s between page loads, met no CAPTCHA, block page or HTTP 429. No published rate limit was found. Keep at least that pause. Blocks 2 and 3 check every wait loop for generic challenge markers (CAPTCHA text or iframes, "verify you are human", "access denied", "unusual traffic") and raise at once; since none was seen here, these markers are not Agoda-specific. On a challenge or a 403/429, stop and tell the user; do not retry, switch user agents or reshape the query.
 
 ## What does not work
 
