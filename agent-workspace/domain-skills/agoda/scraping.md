@@ -8,7 +8,7 @@ robots.txt (fetched 2026-10-24) allows `/search`, `/city/<slug>.html` and `/<slu
 
 - Plain HTTP GET of `/search?...` and of a hotel page returns HTTP 200 with a JavaScript shell (about 430 KB and 340 KB): empty `<title>`, no hotel names, no filled JSON-LD. You need a real browser for results and hotel data.
 - Plain HTTP GET of a city landing page (`/city/bangkok-th.html`, about 87 KB) does contain the numeric city id in `"defaultSearchURL":"/search?city=9395..."`. Use that to build search URLs without the autocomplete widget.
-- In the browser, each result is an `li[data-selenium="hotel-item"]` with `data-hotelid`. Name, star rating, review score and count (from an ARIA label or screen-reader text), nightly price and URL are all on the card. 98 cards per page in this run; 3 pages gave 294 cards and 289 unique properties. The same hotel can appear on two pages (5 did here), so block 2 dedupes by `hotel_id`.
+- In the browser, each result is an `li[data-selenium="hotel-item"]` with `data-hotelid`. Name, star rating, review score and count (from an ARIA label or screen-reader text), nightly price and URL are all on the card. 98 cards per page in these runs; 3 pages gave 294 cards, which were 289 unique properties in one run and 294 in another. The same hotel can appear on two pages (5 did in the first run), so block 2 dedupes by `hotel_id`.
 - Cards are virtualized: only the ones near the viewport have content, so scroll and merge by `data-hotelid`. In a hidden background tab they never render, so block 2 raises unless you opt in to `FOREGROUND = True`.
 - Pagination is a Next button; the URL does not change between pages.
 - Hotel pages carry `<script type="application/ld+json">` of `@type: Hotel` (name, address, postal code, aggregateRating, image, description, map center) plus rendered blocks for stars, live review count, top amenities and the "from USD x" price.
@@ -262,12 +262,12 @@ json.dump(dict(status, results=results), open("agoda_results.json", "w"), indent
 Output on 2026-10-24, so `checkIn` is 2026-11-23 (trimmed):
 
 ```
-search: https://www.agoda.com/search?city=9395&checkIn=2026-11-23&los=2&rooms=1&adults=2&children=0&locale=en-us&currency=USD&ds=khPQ2nGciYo%2FA3Fz
+search: https://www.agoda.com/search?city=9395&checkIn=2026-11-23&los=2&rooms=1&adults=2&children=0&locale=en-us&currency=USD&ds=DVDVA0IN2Y35iqAA
 Page 1 of 75: 98 properties
 Page 2 of 75: 98 properties
 Page 3 of 75: 98 properties
-unique 289 duplicates dropped 5
-{'hotel_id': '51238093', 'name': 'Maison Hotel Bangkok', 'stars': 5, 'review_score': 8.9, 'review_count': 9458, 'price': 72, 'currency': 'USD', 'sold_out': False, 'promoted': False, 'area': 'Sukhumvit, Bangkok - City center', 'url': 'https://www.agoda.com/accom/property?propertyId=51238093', 'page': 1}
+unique 294 duplicates dropped 0
+{'hotel_id': '51238093', 'name': 'Maison Hotel Bangkok', 'stars': 5, 'review_score': 8.9, 'review_count': 9458, 'price': 72, 'currency': 'USD', 'sold_out': False, 'promoted': False, 'area': 'Sukhumvit, Bangkok - City center', 'url': 'https://www.agoda.com/rajah-hotel_2/hotel/bangkok-th.html', 'page': 1}
 ...
 sold_out 24 promoted 4 no price 24 no stars 0 no review score 0
 PARTIAL: stopped at the PAGES = 3 cap on page 3 of 75; more results exist
@@ -275,7 +275,7 @@ PARTIAL: stopped at the PAGES = 3 cap on page 3 of 75; more results exist
 
 ### 3. Hotel page basics (browser)
 
-Run after block 2 in the same tab, or on its own. Uses JSON-LD for the stable fields and the rendered page for star rating, live review count, the "from" price and top amenities. It reuses the tab only if that tab is already on agoda.com, confirms the tab shows the requested URL (path, `propertyId` and stay parameters) before reading, raises on a challenge, and needs a visible tab like block 2 (same `FOREGROUND` opt-in).
+Run after block 2 in the same tab, or on its own. Uses JSON-LD for the stable fields and the rendered page for star rating, live review count, the "from" price and top amenities. It reuses the tab only if that tab is already on agoda.com, confirms the tab shows the requested URL (path, `propertyId` and stay parameters) before reading, raises on a challenge, and needs a visible tab like block 2 (same `FOREGROUND` opt-in). A hotel with no rate for the dates is returned with `from_price` None and `sold_out` True; a page that shows neither a price nor the "Sold out!" heading within 60 s raises.
 
 ```python
 import datetime, json, re, time, urllib.parse
@@ -283,6 +283,7 @@ import datetime, json, re, time, urllib.parse
 HOTEL_URLS = [   # any `url` values from the search rows
     "https://www.agoda.com/bless-residence/hotel/bangkok-th.html",
     "https://www.agoda.com/accom/property?propertyId=14654101",   # the other href form
+    "https://www.agoda.com/accom/property?propertyId=14651963",   # sold out for 2026-11-23 in this run
 ]
 FOREGROUND = False   # opt-in: True may bring this tab to the front (visible to whoever uses that Chrome)
 check_in = (datetime.date.today() + datetime.timedelta(days=30)).isoformat()
@@ -297,6 +298,8 @@ HOTEL = r"""
   const star = (t('[data-selenium="mosaic-hotel-rating"]') || '').match(/([\d.]+) stars? out of 5/);
   const rev = (t('[data-selenium="review-score-with-test"],[data-testid="review-score-with-test"],[data-element-name="review-score-with-test"]') || '').match(/([\d.]+)[\s\S]*?([\d,]+) reviews/);
   const from = (t('[data-element-name="cheapest-room-price-property-nav-bar"]') || '').match(/from ([A-Z]{3}) ([\d,.]+)/);
+  // no rate for these dates: the room section shows an h2 "Sold out!" and no "from" bar
+  const sold_out = [...document.querySelectorAll('h2')].some(h => /^Sold out!?$/i.test(h.innerText.trim()));
   const pid = new URLSearchParams(location.search).get('propertyId');
   const geo = (ld.hasMap || '').match(/center=([-\d.]+)%2c([-\d.]+)/i);
   // free text: drop email addresses and phone-like numbers (9+ digits) before printing
@@ -317,6 +320,7 @@ HOTEL = r"""
     review_count: rev ? parseInt(rev[2].replace(/,/g, '')) : null,
     jsonld_rating: ld.aggregateRating || null,
     from_price: from ? {currency: from[1], amount: parseFloat(from[2].replace(/,/g, ''))} : null,
+    sold_out,
     top_amenities: [...document.querySelectorAll('[data-element-name="atf-top-amenities-item"]')].map(e => e.innerText.trim()),
     image: ld.image ? new URL(ld.image, location.origin).href : null,
     description: redact(ld.description || '').slice(0, 300),
@@ -376,16 +380,18 @@ def open_hotel(url, timeout=90):
         activate_tab(current_tab())
 
 def read_hotel(timeout=60):
+    """Accept the page once name, url and JSON-LD are there and the price state is known:
+    a "from" price, or the "Sold out!" heading (then from_price is None and sold_out is True)."""
     d, deadline = None, time.time() + timeout
     while time.time() < deadline:
         check_challenge()
         raw = try_js(HOTEL)
         d = json.loads(raw) if raw else d
-        if d and d["name"] and d["url"] and d["from_price"] and d["jsonld_loaded"]:
+        if d and d["name"] and d["url"] and d["jsonld_loaded"] and (d["from_price"] or d["sold_out"]):
             return d
         time.sleep(2)
     raise RuntimeError(f"incomplete hotel page at {try_js('location.href')}: {d} "
-                       "(from_price None: sold out for these dates?)")
+                       "(no 'from' price and no 'Sold out!' heading)")
 
 for i, u in enumerate(HOTEL_URLS):
     if i:
@@ -394,7 +400,7 @@ for i, u in enumerate(HOTEL_URLS):
     print(json.dumps(read_hotel(), indent=1, ensure_ascii=False))
 ```
 
-Output on 2026-10-24 (first hotel, description trimmed):
+Output on 2026-10-24 (first hotel in full, description trimmed; then the sold-out one, trimmed):
 
 ```
 {
@@ -424,8 +430,9 @@ Output on 2026-10-24 (first hotel, description trimmed):
  },
  "from_price": {
   "currency": "USD",
-  "amount": 54
+  "amount": 56
  },
+ "sold_out": false,
  "top_amenities": [
   "Free Wi-Fi",
   "Swimming pool",
@@ -436,8 +443,18 @@ Output on 2026-10-24 (first hotel, description trimmed):
   "Bar",
   "Airport transfer"
  ],
- "image": "https://pix8.agoda.net/hotelImages/177997/-1/794165056d07deceb10d1f2d79f00e4c.jpg?ce=0&s=1024x768",
+ "image": "https://pix8.agoda.net/hotelImages/177997/0/229685bbcf34112e88bcfcf75f44976d.jpeg?ce=2&s=1024x768",
  "description": "Experience Comfort and Convenience at The Bless Hotel & Residence, BangkokNestle..."
+}
+...
+{
+ "jsonld_loaded": true,
+ "name": "Madison Bangkok",
+ "url": "https://www.agoda.com/accom/property?propertyId=14651963",
+ ...
+ "from_price": null,
+ "sold_out": true,
+ ...
 }
 ```
 
@@ -475,7 +492,8 @@ Hotel page (block 3):
 | `lat`, `lng` | `center=` parameter of JSON-LD `hasMap` | `13.7337676461285`, `100.567924976349` |
 | `review_score`, `review_count` | `review-score-with-test` block text `"8.5 Excellent 13,034 reviews"` | `8.5`, `13034` |
 | `jsonld_rating` | JSON-LD `aggregateRating` (1-10 scale) | `ratingValue 8.5, reviewCount 12409` |
-| `from_price` | `[data-element-name="cheapest-room-price-property-nav-bar"]` text `"from USD 54"` | `{"currency": "USD", "amount": 54}` |
+| `from_price` | `[data-element-name="cheapest-room-price-property-nav-bar"]` text `"from USD 54"` | `{"currency": "USD", "amount": 54}`, or `null` when sold out |
+| `sold_out` | an `h2` reading `"Sold out!"` in the room section | `false` |
 | `top_amenities` | `[data-element-name="atf-top-amenities-item"]` | `["Free Wi-Fi", "Swimming pool", ...]` |
 | `image` | JSON-LD `image` (protocol-relative, made absolute) | `https://pix8.agoda.net/hotelImages/...` |
 | `description` | JSON-LD `description`, first 300 characters, email addresses and phone-like numbers (9+ digits) replaced | long marketing text |
@@ -486,7 +504,8 @@ Hotel page (block 3):
 - **Hidden tab = no cards.** In a background tab (`document.visibilityState == "hidden"`) cards stayed as empty shells (only "<name> opens in a new tab"); in one run 7 of them never filled however far you scrolled. `activate_tab(current_tab())` fixed it, but it changes the visible tab, so blocks 2 and 3 only call it when you set `FOREGROUND = True` and raise otherwise. In a fresh cloud browser `new_tab` reused the one blank tab, which was already visible, so no activation was needed; with other tabs open, `new_tab` opens a background tab and the hidden-tab error fires (seen in this run).
 - **Virtualized list.** The page starts with 10 `li` elements, grows to 49 and then 98 while you scroll, and cards far from the viewport lose their inner content. Reading once after scrolling to the bottom gave only 44 filled cards out of 98. Collect on every scroll step and merge by `data-hotelid`; a final `scrollIntoView` pass picks up any card that was skipped.
 - **Pagination.** The first page said "Page 1 of 75" for a 2026-11-23 check-in and "Page 1 of 74" for 2026-11-30. Next is `[data-selenium="pagination-next-btn"]`; `location.href` stays the same (Agoda appends `ds=...` and `sort=agodaRecommended`), so you cannot deep-link to page N. Block 2 waits for that label to read page N+1; it does not require the first card to change, since a hotel can repeat across pages. It stops on its own only when the label says `Page N of N`. A missing Next button before that, or a page that does not advance within 60 s, raises. The last page itself was not reached in this run.
-- **Prices depend on dates.** The same hotel page showed "from USD 54" for a 2026-11-23 check-in and "from USD 72" for 2026-11-30. Sold-out cards have no price block (24 of 289 in this run, all of them the cards with `price` None). Always keep `checkIn`, `los`, `adults`, `rooms` with the data.
+- **Prices depend on dates.** The same hotel page showed "from USD 54" for a 2026-11-23 check-in and "from USD 72" for 2026-11-30, and "from USD 56" for 2026-11-23 a few hours later. Sold-out cards have no price block (24 of 289 and 24 of 294 in two runs, all of them the cards with `price` None). Always keep `checkIn`, `los`, `adults`, `rooms` with the data.
+- **Sold-out hotel pages.** Opening a hotel whose search card said "Sold out on your dates!" with the same dates (Madison Bangkok and Jasmine City Hotel Asoke for 2026-11-23) showed an `h2` "Sold out!" with "Our last room is already booked" and no "from" bar. Block 3 returns those pages with `from_price` None and `sold_out` True instead of waiting for a price that never comes.
 - **Locale and currency.** Pass `locale=en-us&currency=USD` on search and `currencyCode=USD` on hotel pages; the regexes match English text ("stars out of 5", "reviews", "from USD").
 - **Review counts disagree.** JSON-LD `aggregateRating.reviewCount` lags the rendered count (12,409 vs 13,034 for the same hotel the same minute; 16,192 vs 17,767 for another). Use the rendered number if you want what users see.
 - **JSON-LD arrives late.** `script[data-selenium="bay-hotel-schema-json-ld"]` is in the DOM empty when the `h1` appears and is filled about 2 s later (0 then 23,163 characters). Reading too early returned `postal`, `lat`, `image` all `null`; block 3 waits for `jsonld_loaded`.

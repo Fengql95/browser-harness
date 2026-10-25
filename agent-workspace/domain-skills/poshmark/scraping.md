@@ -25,7 +25,11 @@ BASE = "https://poshmark.com"
 RETRYABLE = {429, 500, 502, 503, 504}
 SITE_CAP_TOTAL = 5000   # more.total never exceeds this; has_next turns false at page 105
 EMAIL = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
-PHONE = re.compile(r"(?<!\d)(?:\+?1[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}(?!\d)")
+PHONE = re.compile(
+    r"(?<![\w+])(?:\+[\s.-]?|00)[1-9](?:[\s.()-]{0,2}\d){6,14}(?!\d)"   # international: +44 20 7946 0958, 0049 30 123456
+    r"|(?<![\w+])0[1-9](?:[\s.()-]?\d){8,11}(?!\d)"                     # national trunk 0: 020 7946 0958, 07700 900123
+    r"|(?<!\d)\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}(?!\d)")               # North American: (555) 123-4567
+ALLOWED_PATH = re.compile(r"(?:brand|category)/(?!\.\.?$)[^/?#\\]+")   # one segment under /brand or /category
 
 def redact(text):
     """Titles are seller-written free text: mask any email address or phone number in them."""
@@ -72,7 +76,10 @@ def fetch(url, budget_s=120):
         delay *= 2
 
 def browse_url(path, filters=None, page=1):
-    """path: 'brand/<Brand>-<Dept>-<Category>' or 'category/<Dept>-<Category>' (both allowed by robots.txt)."""
+    """path: 'brand/<Brand>-<Dept>-<Category>' or 'category/<Dept>-<Category>' (both allowed by robots.txt).
+    Anything else (e.g. 'search', which robots.txt disallows) raises before any request is made."""
+    if not ALLOWED_PATH.fullmatch(path):
+        raise ValueError(f"refusing {path!r}: only brand/<slug> and category/<slug> browse pages are allowed")
     q = list((filters or {}).items())
     if page > 1:
         q.append(("max_id", page))
@@ -161,6 +168,11 @@ try:   # this slug 301s to a different canonical path, so scrape() refuses it an
     scrape("brand/Lululemon_Athletica-Women-Pants", {"sort_by": "added_desc"}, max_pages=1)
 except RuntimeError as e:
     print("refused:", e)
+
+try:   # robots.txt disallows /search: refused locally, nothing is requested
+    scrape("search", {"query": "levis"})
+except ValueError as e:
+    print("refused:", e)
 ```
 
 Real output (trimmed):
@@ -170,11 +182,12 @@ page 1: 48 rows, 48 new, total=5000, next=True
 page 2: 48 rows, 48 new, total=5000, next=True
 page 3: 48 rows, 48 new, total=5000, next=True
 144 listings, status: truncated_max_pages
-{"id": "6add62f04adcb3f097bb212d", "title": "Levi’s Ribcage Straight Ankle High Waisted Jeans in Space Ripple size 28", "brand": "Levi's", "size": "US 28", "price": 44.0, "original_price": 98.0, "currency": "USD", "department": "Women", "category": "Denim", "status": "available", "url": "https://poshmark.com/listing/6add62f04adcb3f097bb212d"}
+{"id": "6add680c8925d3da8fdfd464", "title": "Levis | 712 Slim Fit 28 Distress Jeans", "brand": "Levi's", "size": "US 28", "price": 30.0, "original_price": 67.0, "currency": "USD", "department": "Women", "category": "Denim", "status": "available", "url": "https://poshmark.com/listing/6add680c8925d3da8fdfd464"}
 ...
 page 1: 0 rows, 0 new, total=0, next=False
 0 listings for an unknown brand, status: complete
 refused: server sent us elsewhere: asked https://poshmark.com/brand/Lululemon_Athletica-Women-Pants?sort_by=added_desc, got https://poshmark.com/brand/lululemon_athletica-Women-Pants_&_Jumpsuits?sort_by=added_desc; call scrape() again with that path if it is the page you want
+refused: refusing 'search': only brand/<slug> and category/<slug> browse pages are allowed
 ```
 
 `truncated_max_pages` is expected here: `max_pages=3` stopped the run while `has_next` was still true.
@@ -187,10 +200,12 @@ A row with an original price set (from `brand/lululemon_athletica-Women-Pants_&_
 
 ### 2. Same data from a browser tab (when you are already driving one)
 
-The hydrated page keeps `window.__INITIAL_STATE__`, so the browser path reads the same JSON instead of scraping tiles. `open_page` waits until the tab is on exactly the requested URL (query included) and refuses a server redirect to a different path at once.
+The hydrated page keeps `window.__INITIAL_STATE__`, so the browser path reads the same JSON instead of scraping tiles. `open_page` only accepts `https://poshmark.com/brand/<slug>` and `/category/<slug>` URLs, waits until the tab is on exactly the requested URL (query included) and refuses a server redirect to a different path at once.
 
 ```python
-import json, time, urllib.parse
+import json, re, time, urllib.parse
+
+ALLOWED_PATH = re.compile(r"/(?:brand|category)/(?!\.\.?$)[^/?#\\]+")   # robots.txt allows these; /search etc. are disallowed
 
 EXTRACT = r"""(() => {
   if (document.querySelector('#px-captcha, iframe[src*="captcha"]')) return {error: 'challenge on page'};
@@ -205,8 +220,9 @@ EXTRACT = r"""(() => {
   const bad = data.find(it => !/^[0-9a-f]{24}$/.test(it.id || '') || !it.title || !money(it.price_amount));
   if (bad) return {error: `listing ${bad.id} is missing id/title/price`};
   // Titles are seller-written free text: mask any email address or phone number.
+  // Same patterns as the Python block: international (+44 ..., 0049 ...), national trunk 0, North American.
   const redact = t => t.replace(/[\w.+-]+@[\w-]+\.[\w.-]+/g, '[email]')
-    .replace(/(?<!\d)(?:\+?1[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}(?!\d)/g, '[phone]');
+    .replace(/(?<![\w+])(?:\+[\s.-]?|00)[1-9](?:[\s.()-]{0,2}\d){6,14}(?!\d)|(?<![\w+])0[1-9](?:[\s.()-]?\d){8,11}(?!\d)|(?<!\d)\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}(?!\d)/g, '[phone]');
   return {
     total: (g.more || {}).total, has_next: !!(g.more || {}).is_next_max_id_present,
     rows: data.map(it => ({
@@ -226,6 +242,9 @@ def same_url(a, b):
     return (pa.netloc, urllib.parse.unquote(pa.path), q(pa)) == (pb.netloc, urllib.parse.unquote(pb.path), q(pb))
 
 def open_page(url, first=False, settle_s=20):
+    u = urllib.parse.urlparse(url)
+    if u.scheme != "https" or u.netloc != "poshmark.com" or not ALLOWED_PATH.fullmatch(urllib.parse.unquote(u.path)):
+        raise ValueError(f"refusing {url}: only https://poshmark.com/brand/<slug> and /category/<slug> pages are allowed")
     new_tab(url) if first else goto_url(url)
     wait_for_load()
     want = urllib.parse.urlparse(url)
@@ -273,28 +292,34 @@ try:   # this slug 301s to a different canonical path, so open_page() refuses it
     open_page("https://poshmark.com/brand/Lululemon_Athletica-Women-Pants?sort_by=added_desc")
 except RuntimeError as e:
     print("refused:", e)
+
+try:   # robots.txt disallows /search: refused before the tab navigates
+    open_page("https://poshmark.com/search?query=nike")
+except ValueError as e:
+    print("refused:", e)
 ```
 
 Real output (trimmed):
 
 ```
 page 1: 48 rows, 48 new, next=True
-page 2: 48 rows, 46 new, next=True
-page 3: 48 rows, 47 new, next=True
-141 listings, status: truncated_max_pages
+page 2: 48 rows, 48 new, next=True
+page 3: 48 rows, 46 new, next=True
+142 listings, status: truncated_max_pages
 [
  {
-  "id": "6add640441ae6654d547f803",
-  "title": "Nike Men’s Black Air Force 1 Sneakers with Silver Swoosh",
+  "id": "6add6b7e3fce2bd5a7c61a22",
+  "title": "BRAND NEW: Nike Dunk Low Retro \"White Black Panda\"",
   "brand": "Nike",
-  "size": "US 9",
-  "price": 65,
+  "size": "US 10",
+  "price": 100,
   "original_price": null,
-  "url": "https://poshmark.com/listing/6add640441ae6654d547f803"
+  "url": "https://poshmark.com/listing/6add6b7e3fce2bd5a7c61a22"
  },
  ...
 ]
 refused: redirected: asked https://poshmark.com/brand/Lululemon_Athletica-Women-Pants?sort_by=added_desc, got https://poshmark.com/brand/lululemon_athletica-Women-Pants_&_Jumpsuits?sort_by=added_desc; open that URL instead if it is the page you want
+refused: refusing https://poshmark.com/search?query=nike: only https://poshmark.com/brand/<slug> and /category/<slug> pages are allowed
 ```
 
 ## URL patterns and filters (all observed)
@@ -319,7 +344,7 @@ refused: redirected: asked https://poshmark.com/brand/Lululemon_Athletica-Women-
 | Output field | Source in `gridData.data[i]` | Notes |
 |---|---|---|
 | `id` | `id` | 24-hex listing ID, also the last segment of the listing URL |
-| `title` | `title` | seller-written, may contain Unicode quotes; email addresses and phone numbers are replaced with `[email]` / `[phone]` |
+| `title` | `title` | seller-written, may contain Unicode quotes; email addresses and phone numbers (international `+44 ...` / `00..`, national `0...`, North American) are replaced with `[email]` / `[phone]` |
 | `brand` | `brand` | display name, e.g. `"lululemon athletica"` |
 | `size` | `size_obj.display_with_size_system`, fallback `size` | e.g. `"US 28"`, or multi-system like `"US 11 / UK 10 / EUR 45 / cm 29"`; `size` alone is `"28"`, and can be `"Various"` |
 | `price` | `price_amount.val` (string) | also integer `price` |
@@ -345,7 +370,7 @@ Each listing object also carries seller fields (`creator_username`, `creator_ful
 - In the browser, the JSON-LD `<script type="application/ld+json">` blocks are absent from the live DOM after hydration (0 in a fresh cloud browser, while a same-origin refetch of the HTML had them). Neither block reads JSON-LD.
 - Size filter buttons (`#size-28`) are hidden until the Size dropdown is opened, and the choice only applies after clicking Apply. Building the URL directly is simpler.
 - Pacing: 2 s between pages was used throughout with no 429 or captcha. Keep at least that. On any 403 or `showCaptcha: true` the code raises; stop and hand it to a human, do not retry or change the request to get past it. `fetch` retries only 429/5xx/network errors, all under one 120 s deadline per URL that also bounds reading the body, with no sleep after the last attempt.
-- Both blocks refuse a page if the browser or server ended up on a different path or query than requested, if any listing lacks a 24-hex `id`, a `title` or a finite positive `price`, or if a page has 0 rows while `total` is nonzero or `has_next` is true.
+- Both blocks refuse, before any request, a path or URL that is not one segment under `/brand/` or `/category/` (so `/search`, `/api`, `/listings`, `/users` and `..` tricks never go out). They also refuse a page if the browser or server ended up on a different path or query than requested, if any listing lacks a 24-hex `id`, a `title` or a finite positive `price`, or if a page has 0 rows while `total` is nonzero or `has_next` is true.
 
 ## What does not work
 
