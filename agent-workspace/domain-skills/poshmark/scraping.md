@@ -28,7 +28,7 @@ EMAIL = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
 PHONE = re.compile(
     r"(?<![\w+])(?:\+[\s.-]?|00)[1-9](?:[\s.()-]{0,2}\d){6,14}(?!\d)"   # international: +44 20 7946 0958, 0049 30 123456
     r"|(?<![\w+])0[1-9](?:[\s.()-]?\d){8,11}(?!\d)"                     # national trunk 0: 020 7946 0958, 07700 900123
-    r"|(?<!\d)\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}(?!\d)")               # North American: (555) 123-4567
+    r"|(?<!\d)(?:1[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}(?!\d)")  # North American: (555) 123-4567, 1-555-123-4567, 15551234567
 ALLOWED_PATH = re.compile(r"(?:brand|category)/(?!\.\.?$)[^/?#\\]+")   # one segment under /brand or /category
 
 def redact(text):
@@ -222,7 +222,7 @@ EXTRACT = r"""(() => {
   // Titles are seller-written free text: mask any email address or phone number.
   // Same patterns as the Python block: international (+44 ..., 0049 ...), national trunk 0, North American.
   const redact = t => t.replace(/[\w.+-]+@[\w-]+\.[\w.-]+/g, '[email]')
-    .replace(/(?<![\w+])(?:\+[\s.-]?|00)[1-9](?:[\s.()-]{0,2}\d){6,14}(?!\d)|(?<![\w+])0[1-9](?:[\s.()-]?\d){8,11}(?!\d)|(?<!\d)\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}(?!\d)/g, '[phone]');
+    .replace(/(?<![\w+])(?:\+[\s.-]?|00)[1-9](?:[\s.()-]{0,2}\d){6,14}(?!\d)|(?<![\w+])0[1-9](?:[\s.()-]?\d){8,11}(?!\d)|(?<!\d)(?:1[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}(?!\d)/g, '[phone]');
   return {
     total: (g.more || {}).total, has_next: !!(g.more || {}).is_next_max_id_present,
     rows: data.map(it => ({
@@ -304,17 +304,17 @@ Real output (trimmed):
 ```
 page 1: 48 rows, 48 new, next=True
 page 2: 48 rows, 48 new, next=True
-page 3: 48 rows, 46 new, next=True
-142 listings, status: truncated_max_pages
+page 3: 48 rows, 48 new, next=True
+144 listings, status: truncated_max_pages
 [
  {
-  "id": "6add6b7e3fce2bd5a7c61a22",
-  "title": "BRAND NEW: Nike Dunk Low Retro \"White Black Panda\"",
+  "id": "6add6e68441b19999eb53d55",
+  "title": "Nike air force 1 certified lover boy",
   "brand": "Nike",
-  "size": "US 10",
-  "price": 100,
+  "size": "US 12",
+  "price": 89,
   "original_price": null,
-  "url": "https://poshmark.com/listing/6add6b7e3fce2bd5a7c61a22"
+  "url": "https://poshmark.com/listing/6add6e68441b19999eb53d55"
  },
  ...
 ]
@@ -344,7 +344,7 @@ refused: refusing https://poshmark.com/search?query=nike: only https://poshmark.
 | Output field | Source in `gridData.data[i]` | Notes |
 |---|---|---|
 | `id` | `id` | 24-hex listing ID, also the last segment of the listing URL |
-| `title` | `title` | seller-written, may contain Unicode quotes; email addresses and phone numbers (international `+44 ...` / `00..`, national `0...`, North American) are replaced with `[email]` / `[phone]` |
+| `title` | `title` | seller-written, may contain Unicode quotes; email addresses and phone numbers (international `+44 ...` / `00..`, national `0...`, North American with or without a leading `1`) are replaced with `[email]` / `[phone]` |
 | `brand` | `brand` | display name, e.g. `"lululemon athletica"` |
 | `size` | `size_obj.display_with_size_system`, fallback `size` | e.g. `"US 28"`, or multi-system like `"US 11 / UK 10 / EUR 45 / cm 29"`; `size` alone is `"28"`, and can be `"Various"` |
 | `price` | `price_amount.val` (string) | also integer `price` |

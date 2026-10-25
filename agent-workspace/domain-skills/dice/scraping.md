@@ -122,9 +122,9 @@ def normalize(j):
 def search_dice(keyword=None, location=None, max_pages=3, filters=None):
     """Returns (jobs, info). info["status"] is never "complete": Dice serves no
     stable snapshot, so a matching count does not prove every job was seen.
-    "count_matched" = totalResults stayed the same on every page and at least that
-    many unique jobs were collected (still unverified, see reason); otherwise
-    "partial" with a reason."""
+    "count_matched" = every requested page came back as asked, totalResults stayed
+    the same on every page and at least that many unique jobs were collected
+    (still unverified, see reason); otherwise "partial" with a reason."""
     if max_pages < 1:
         raise ValueError("max_pages must be >= 1")
     jobs, seen, meta, reason, totals, counts = [], set(), {}, None, [], []
@@ -147,7 +147,8 @@ def search_dice(keyword=None, location=None, max_pages=3, filters=None):
     fetched = page if reason is None else page - 1
     # Largest count seen, so a total that shrank mid-crawl cannot make a short crawl look complete.
     total, pages = max(totals), max(counts)
-    if len(jobs) >= total and min(totals) == total:
+    # A failed pagination step (reason already set) is always partial, whatever the count says.
+    if reason is None and len(jobs) >= total and min(totals) == total:
         # Order reshuffles and postings can swap without changing the count,
         # so a matching count is the best signal available, not proof.
         status, reason = "count_matched", UNVERIFIED
@@ -184,11 +185,11 @@ Output observed (trimmed):
 {"title": "Python Developer - Houston, TX (Locals only)", "company": "Source Mantra Inc", "location": "Houston, Texas, USA", "workplace": "On-Site", "employment_type": "Third Party, Contract", "posted": "2026-10-23T19:05:49Z", "salary": "$$65 - $70", "url": "https://www.dice.com/job-detail/7a92a6a3-2b6f-49be-9f2a-c6737ea95e2e", "guid": "7a92a6a3-2b6f-49be-9f2a-c6737ea95e2e"}
 {"title": "Python Developer", "company": "Mindlance", "location": "Houston, Texas, USA", "workplace": "On-Site", "employment_type": "Contract", "posted": "2026-10-15T21:57:49Z", "salary": "50 - 58", ...}
 {"title": "Python Developer - AWS, AI, LLM -  ZL", "company": "SES", "location": null, "workplace": "Remote", "employment_type": "Full-time", ...}
-remote devops: {'status': 'partial', 'reason': 'max_pages=2 reached', 'total': 239, 'page_count': 12, 'pages_fetched': 2, 'collected': 38}
+remote devops: {'status': 'partial', 'reason': 'max_pages=2 reached', 'total': 239, 'page_count': 12, 'pages_fetched': 2, 'collected': 39}
 houston all pages: {'status': 'count_matched', 'reason': 'unique jobs reached totalResults, but Dice has no stable snapshot: not verified complete', 'total': 132, 'page_count': 7, 'pages_fetched': 7, 'collected': 132}
 ```
 
-`collected` for the remote DevOps search was 38 on this run and 39 and 40 on earlier 2026-10-24 runs, because page 2 repeats some page-1 jobs. The Houston `max_pages=30` search fetched all 7 pages and stopped at `pageCount`: 132 of 132 unique jobs on this run and on 2026-10-23, 131 of 132 on an earlier 2026-10-24 run (returned as `status: "partial"`, reason `relevance order reshuffled between pages`). Never report a `partial` result as the full set, and present `count_matched` as "count reached, not verified complete".
+`collected` for the remote DevOps search was 39 on this run and 38, 39 and 40 on earlier 2026-10-24 runs, because page 2 repeats some page-1 jobs. The Houston `max_pages=30` search fetched all 7 pages and stopped at `pageCount`: 132 of 132 unique jobs on this run and on 2026-10-23, 131 of 132 on an earlier 2026-10-24 run (returned as `status: "partial"`, reason `relevance order reshuffled between pages`). Never report a `partial` result as the full set, and present `count_matched` as "count reached, not verified complete".
 
 URL shapes that returned 200 with a `jobList`:
 
@@ -283,7 +284,7 @@ def browser_search(keyword=None, location=None, max_pages=2):
         if page >= meta["pageCount"]:
             break
     total, pages = max(totals), max(counts)   # largest seen: a shrinking total cannot fake a match
-    if len(rows) >= total and min(totals) == total:
+    if reason is None and len(rows) >= total and min(totals) == total:   # page mismatch = partial
         # Never "complete": order reshuffles and postings can swap without changing the count.
         status = "count_matched"
         reason = "unique jobs reached totalResults, but Dice has no stable snapshot: not verified complete"
@@ -306,12 +307,12 @@ for r in rows[:3]:
 Output observed (trimmed):
 
 ```
-{'status': 'partial', 'reason': 'max_pages=2 reached', 'total': 1588, 'pages_fetched': 2, 'collected': 39}
+{'status': 'partial', 'reason': 'max_pages=2 reached', 'total': 1588, 'pages_fetched': 2, 'collected': 40}
 {"title": "DevOps Engineer", "company": "Dexian DISYS", "location": "Charlotte, North Carolina, USA", "employment_type": "Contract", "posted": "2026-10-15T20:11:32Z", "url": "https://www.dice.com/job-detail/be07b58c-3595-4790-a5c4-fed0892f9c8c"}
 {"title": "DevOps Engineer", "company": "TechNix LLC", "location": "Raleigh, North Carolina, USA", "employment_type": "Contract, Third Party", ...}
 ```
 
-This run got 39 unique jobs out of 40 slots; across runs the same call collected 38 and 28 (2026-10-23) and 35 and 40 (2026-10-24), because the relevance order reshuffles between requests and page 2 repeats some page-1 jobs. See "Unstable order" under Gotchas.
+This run got 40 unique jobs out of 40 slots; across runs the same call collected 38 and 28 (2026-10-23) and 35, 39 and 40 (2026-10-24), because the relevance order reshuffles between requests and page 2 repeats some page-1 jobs. See "Unstable order" under Gotchas.
 
 DOM fallback if the JSON ever disappears: each result is `[data-testid="job-card"][role="article"]` inside `role="list"` with `aria-label="Job search results"`; the card link `a[data-testid="job-search-job-card-link"]` has `href="/job-detail/<guid>"` and `aria-label="View Details for <title> (<id>)"`. Card text only has relative dates ("Yesterday", "2d ago"), so prefer the JSON.
 
