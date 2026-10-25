@@ -155,10 +155,10 @@ Neighboring cities overlap (Oakland/Berkeley share rows), so the unique count gr
 
 ### 2. Profiles: complaint counts, rating, accreditation, website (browser)
 
-Self-contained. Reads the JSON written by block 1 if present and enriches the first `LIMIT` rows, then shows a profile with many complaints. About 3 s between profiles. Raises on a challenge, a wrong landing URL, missing `businessProfile` state or missing name, rating or complaint counts; returns `None` only for BBB's 404 page.
+Self-contained. Reads the JSON written by block 1 if present and enriches the first `LIMIT` rows, then shows a profile with many complaints and a stale profile URL that BBB redirects. About 3 s between profiles. Raises on a challenge, a landing URL that is neither the requested one nor the same profile id, missing `businessProfile` state or missing name, rating or complaint counts; returns `None` only for BBB's 404 page.
 
 ```python
-import json, os, tempfile, time
+import json, os, re, tempfile, time
 
 def bbb_state():
     t = js("(() => { const s = [...document.scripts].find(s => /__PRELOADED_STATE__\\s*=/.test(s.textContent)); return s ? s.textContent : null })()")
@@ -167,8 +167,9 @@ def bbb_state():
     # Seen both as `__PRELOADED_STATE__ = {...};` and minified `__PRELOADED_STATE__={...}`.
     return json.loads(t.split("=", 1)[1].strip().rstrip(";"))
 
-def bbb_open(url, settle=2.0):
-    """Open url. None for BBB's 404 page; raises on a challenge or if the tab is not on url."""
+def bbb_open(url, settle=2.0, same=None):
+    """Open url. None for BBB's 404 page; raises on a challenge or if the tab is not on url
+    (a different landing URL is read only when same(href) says it is the same page)."""
     goto_url(url)
     wait_for_load()
     time.sleep(settle)
@@ -178,12 +179,22 @@ def bbb_open(url, settle=2.0):
         raise RuntimeError(f"Cloudflare challenge on {url}: stop and tell the user; do not retry around it")
     if "Page not found" in title:
         return None
-    if href.rstrip("/") != url.rstrip("/"):
+    if href.rstrip("/") != url.rstrip("/") and not (same and same(href)):
         raise RuntimeError(f"asked for {url} but the tab is on {href}; not reading it")
     return href
 
+# Profile URLs end in <bbbId>-<businessId>; BBB redirects stale name/city/category slugs to the canonical URL.
+PROFILE = re.compile(r"^https://www\.bbb\.org/(?:us|ca)/[a-z]{2}/[a-z0-9-]+/profile/[a-z0-9-]+/[a-z0-9-]*-(\d{4}-\d+)/?$")
+
+def profile_id(url):
+    m = PROFILE.match(url or "")
+    return m.group(1) if m else None
+
 def bbb_profile(profile_url):
-    href = bbb_open(profile_url)
+    pid = profile_id(profile_url)
+    if not pid:
+        raise ValueError(f"not a BBB profile URL: {profile_url}")
+    href = bbb_open(profile_url, same=lambda h: profile_id(h) == pid)  # query-free, same id, or raise
     if not href:
         return None
     bp = (bbb_state() or {}).get("businessProfile")
@@ -206,6 +217,7 @@ def bbb_profile(profile_url):
             if x.get("@type") == "LocalBusiness":
                 ld = {p["name"]: p["value"] for p in x.get("additionalProperty") or []}
     return {
+        "requested_url": profile_url,
         "profile_url": href,
         "name": name,
         "rating": rating,
@@ -232,10 +244,15 @@ for row in rows[:LIMIT]:
         continue
     print(f'{row["name"][:34]:34} {prof["rating"]:3} acc={prof["accredited"]!s:5} '
           f'complaints_3y={prof["complaints_3y"]} 12m={prof["complaints_12m"]} reviews={prof["reviews"]} site={prof["website"]}')
+    if prof["profile_url"].rstrip("/") != row["profile_url"].rstrip("/"):
+        print("  redirected to", prof["profile_url"])
 if len(rows) > LIMIT:
     print(f"PARTIAL: enriched {LIMIT} of {len(rows)} rows (LIMIT={LIMIT})")
 
 print(json.dumps(bbb_profile("https://www.bbb.org/us/ny/new-york/profile/telephones/verizon-communications-0011-1568"), indent=1))
+time.sleep(3)
+moved = bbb_profile("https://www.bbb.org/us/ca/oakland/profile/plumber/atlas-plumbing-rooter-1116-116593")
+print("redirected:", moved["requested_url"], "->", moved["profile_url"])
 ```
 
 Output from the test run (trimmed):
@@ -248,6 +265,7 @@ J. E. Brown Mechanical Co., Inc.   A+  acc=True  complaints_3y=0 12m=0 reviews=0
 Mr. Rooter Plumbing of San Francis A+  acc=True  complaints_3y=0 12m=0 reviews=0 site=https://www.mrrooter.com/san-francisco/
 PARTIAL: enriched 5 of 61 rows (LIMIT=5)
 {
+ "requested_url": "https://www.bbb.org/us/ny/new-york/profile/telephones/verizon-communications-0011-1568",
  "profile_url": "https://www.bbb.org/us/ny/new-york/profile/telephones/verizon-communications-0011-1568",
  "name": "Verizon Communications",
  "rating": "A+",
@@ -262,14 +280,15 @@ PARTIAL: enriched 5 of 61 rows (LIMIT=5)
  "jsonld_complaints_3y": "3730",
  "jsonld_accreditation": "Not BBB Accredited"
 }
+redirected: https://www.bbb.org/us/ca/oakland/profile/plumber/atlas-plumbing-rooter-1116-116593 -> https://www.bbb.org/us/ca/san-francisco/profile/plumber/atlas-plumbing-rooter-1116-116593
 ```
 
 ### 3. Discover valid category slugs for a state from the sitemap (plain Python, no browser)
 
-Category slugs are not guessable (`telephone-companies` is a 404, `telephones` works). The state-category sitemaps list them, sorted by state. `fetch` retries only network errors and 5xx, stops at once on 403/429, and every attempt, backoff and read shares one deadline (no new wait starts after 110 s and each socket wait is capped at 10 s, so a call ends within 120 s).
+Category slugs are not guessable (`telephone-companies` is a 404, `telephones` works). The state-category sitemaps list them, sorted by state. `fetch` retries only network errors and 5xx, raises at once on any other HTTP status (403/429 reported as blocked) or an undecodable body, and every attempt, backoff and read shares one deadline (no new wait starts after 110 s and each socket wait is capped at 10 s, so a call ends within 120 s).
 
 ```python
-import re, time, urllib.error, urllib.request
+import http.client, re, time, urllib.error, urllib.request
 
 UA = "bbb-sitemap-reader/1.0 (python-urllib)"
 BUDGET_S, WAIT_S = 110, 10
@@ -291,9 +310,11 @@ def fetch(url, tries=3):
         except urllib.error.HTTPError as e:
             if e.code in (403, 429):
                 raise RuntimeError(f"{url}: HTTP {e.code}, blocked or rate limited; stopping, not retrying") from e
-            err = e
-        except Exception as e:
-            err = e
+            if e.code < 500:
+                raise RuntimeError(f"{url}: HTTP {e.code}; not retrying") from e
+            err = e  # 5xx: retry
+        except (OSError, http.client.HTTPException) as e:
+            err = e  # network error or timeout: retry; decode and other errors propagate at once
         if attempt >= tries or deadline - time.monotonic() <= delay:
             break  # last attempt, or no budget left after a backoff: raise now, no sleep
         time.sleep(delay)  # 5 s, 10 s, ...
@@ -352,6 +373,7 @@ Output from the test run:
 | `related_categories` | `searchResult.relatedCategories[].url` | last path segment = category slug |
 | `complaints_3y` / `complaints_12m` | profile `reviewsComplaintsSummary.totalClosedComplaintsPastThreeYears` / `...PastTwelveMonths` | required ints; JSON-LD `additionalProperty` "BBB Complaints Filed in Last 3 Years" matches |
 | `reviews`, `avg_stars` | `reviewsTotal`, `averageOfReviewStarRatings` | 0 when no reviews |
+| `requested_url`, `profile_url` (profile) | URL asked for, final `location.href` | differ only after a redirect to the same `<bbbId>-<businessId>` profile; report `profile_url` |
 | `website` | profile `urls.primary` | not present in listings |
 | `rating` (profile) | `rating.bbbRating` | required; `NR` comes with `ratingReasonNotRated` text |
 | `jsonld_complaints_3y`, `jsonld_accreditation` | JSON-LD `additionalProperty` | strings, e.g. `"3730"`, `"Not BBB Accredited"` |
@@ -365,10 +387,11 @@ Output from the test run:
 - Unknown city slug: the URL keeps the fake city but BBB serves the state-level list (`location.displayText` is `None`, heading location "USA"). The helper returns `None`. Unknown category slug: title "Page not found", no state; the helper returns `None`.
 - One company can have several BBB profiles under different local BBBs with different accreditation: the New York "telephones" listing links Verizon Communications at `...-0121-411` (accredited, 3,730 complaints in 3 years), while `...-0011-1568` is "Not BBB Accredited" with the same complaint counts. Report the profile URL with every number.
 - A listing's `reportUrl` can point to another state (a San Francisco movers row linked to a Massachusetts headquarters profile). Keep the profile URL, not the listing's city, as the business location.
+- Stale profile URLs redirect: a wrong name slug, another city or `plumbers` instead of `plumber` in front of `atlas-plumbing-rooter-1116-116593` all landed on the canonical `/us/ca/san-francisco/profile/plumber/atlas-plumbing-rooter-1116-116593` (2026-10-24). `bbb_profile` reads the page only when the final URL ends in the same `<bbbId>-<businessId>` with no query, and returns both `requested_url` and the final `profile_url`; any other landing raises.
 - Cookie banner ("Accept All Cookies") is shown but does not block the embedded data; no click needed.
 - Canada uses the same layout under `/ca/<province>/<city>/category/<category>` (Toronto plumbers: 1,259 results, 15 rows).
 - Profile JSON-LD and `contactInformation` can include named owners/contacts and an obfuscated email. The helpers do not read them; leave them out unless you have a reason and a lawful basis to store them.
-- No challenge or rate limiting was hit in about 85 browser page loads at 2 to 3 s spacing on 2026-10-23, nor in the 16 page loads of the 2026-10-24 run. If a "Just a moment..." title or a Cloudflare challenge frame appears, the helpers raise: stop and tell the user.
+- No challenge or rate limiting was hit in about 85 browser page loads at 2 to 3 s spacing on 2026-10-23, nor in the 16 page loads of the first 2026-10-24 run or the 18 of the second. If a "Just a moment..." title or a Cloudflare challenge frame appears, the helpers raise: stop and tell the user.
 
 ## What does not work
 

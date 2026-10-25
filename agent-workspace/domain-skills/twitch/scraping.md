@@ -189,12 +189,12 @@ TRUNCATED: stopped at MAX_CHANNELS=150 (more were already loaded); 150 channels 
   "login": "<login>",
   "display_name": "<display name>",
   "title": "<stream title>",
-  "viewers_text": "4.7K viewers",
-  "tags": ["<tag>", "English"],
-  "verified": true,
+  "viewers_text": "6.4K viewers",
+  "tags": ["<tag>", "<tag>", "<tag>"],
+  "verified": false,
   "thumbnail": "https://static-cdn.jtvnw.net/previews-ttv/live_user_<login>-640x360.jpg",
-  "grid_position": 1,
-  "viewers": 4700,
+  "grid_position": 27,
+  "viewers": 6400,
   "url": "https://www.twitch.tv/<login>",
   "rank": 1
  },
@@ -337,11 +337,11 @@ TRUNCATED: stopped at MAX_CATEGORIES=100 (more were already loaded)
 100 categories; 99 are /directory/category/ pages
 {"complete": false, "stopped_at_cap": true, "loaded": 109, "returned": 100}
 [
- {"name": "Stream-o-Ween", "path": "/directory/event/stream-o-ween-2026", "viewers_text": "34.6K viewers", "tags": [], "kind": "event", "slug": "stream-o-ween-2026", "viewers": 34600, ...},
- {"name": "Just Chatting", "path": "/directory/category/just-chatting", "viewers_text": "206K viewers", "tags": ["IRL"],
-  "box_art": "https://static-cdn.jtvnw.net/ttv-boxart/509658-285x380.jpg", "rank": 2, "kind": "category", "slug": "just-chatting", "viewers": 206000,
+ {"name": "Stream-o-Ween", "path": "/directory/event/stream-o-ween-2026", "viewers_text": "34.4K viewers", "tags": [], "kind": "event", "slug": "stream-o-ween-2026", "viewers": 34400, ...},
+ {"name": "Just Chatting", "path": "/directory/category/just-chatting", "viewers_text": "200K viewers", "tags": ["IRL"],
+  "box_art": "https://static-cdn.jtvnw.net/ttv-boxart/509658-285x380.jpg", "rank": 2, "kind": "category", "slug": "just-chatting", "viewers": 200000,
   "url": "https://www.twitch.tv/directory/category/just-chatting"},
- {"name": "Call of Duty: Modern Warfare 4", "path": "/directory/category/call-of-duty-modern-warfare-4", "viewers_text": "71.7K viewers", "tags": ["FPS", "Shooter", "Action"], "rank": 3, ...}
+ {"name": "Call of Duty: Modern Warfare 4", "path": "/directory/category/call-of-duty-modern-warfare-4", "viewers_text": "67.4K viewers", "tags": ["FPS", "Shooter", "Action"], "rank": 3, ...}
 ]
 ```
 
@@ -367,8 +367,26 @@ def redact(s):
     s = EMAIL.sub("[email]", s)
     return PHONE.sub(lambda m: "[phone]" if sum(ch.isdigit() for ch in m.group()) >= 9 else m.group(), s)
 
+# Bot-check markers searched in the WHOLE body of every response (200 or error). A bare "captcha" is not one:
+# normal Twitch pages (4 of 4 saved) name a "features.auth.components.captcha.fun-captcha" script chunk.
+CHALLENGE_RE = re.compile(
+    r"challenges\.cloudflare\.com|/cdn-cgi/challenge-platform|captcha-delivery\.com|px-captcha|g-recaptcha|h-captcha"
+    r"|arkoselabs|verify (that )?you are (a )?human|are you a robot|unusual traffic from your"
+    r"|<title[^>]*>[^<]*(captcha|access denied|attention required|just a moment)", re.I)
+
+def body(data, headers):
+    if (headers.get("Content-Encoding") or "") == "gzip":
+        data = gzip.decompress(data)
+    return data.decode("utf-8", "replace")
+
+def check_challenge(url, page):
+    m = CHALLENGE_RE.search(page)
+    if m:
+        raise RuntimeError(f"{url}: bot check page (marker {m.group(0)[:60]!r}); stopping, not retrying")
+
 def fetch(url, deadline):
-    """GET with exponential backoff on 429/5xx until `deadline`; no sleep when the next try would miss it."""
+    """GET with exponential backoff on 429/5xx until `deadline`; no sleep when the next try would miss it.
+    The body is checked for a bot check before any retry or acceptance."""
     delay = 2
     while True:
         left = deadline - time.time()
@@ -377,19 +395,19 @@ def fetch(url, deadline):
         req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept-Encoding": "gzip", "Accept-Language": "en-US"})
         try:
             with urllib.request.urlopen(req, timeout=min(20, left)) as r:
-                data = r.read()
-                if r.headers.get("Content-Encoding") == "gzip":
-                    data = gzip.decompress(data)
-                page = data.decode("utf-8")
+                page = body(r.read(), r.headers)
         except urllib.error.HTTPError as e:
+            try:
+                err_page = body(e.read(), e.headers or {})
+            except Exception:          # no readable error body
+                err_page = ""
+            check_challenge(url, err_page)   # a challenge on a 403/429/5xx stops here, before any retry
             if e.code not in (429, 500, 502, 503, 504) or time.time() + delay >= deadline:
                 raise          # 403 and other blocks surface at once; retryable codes stop at the deadline
             time.sleep(delay)
             delay *= 2
             continue
-        t = re.search(r"<title[^>]*>(.*?)</title>", page, re.S | re.I)
-        if t and re.search(r"captcha|verify (that )?you are (a )?human|are you a robot|access denied", t.group(1), re.I):
-            raise RuntimeError(f"{url}: bot check page ({t.group(1).strip()[:60]!r}); stopping")
+        check_challenge(url, page)
         return page
 
 def meta(page, key):
@@ -698,8 +716,8 @@ With `LOGINS` set to the top 3 VALORANT channels plus an unknown login, the live
 - **The about panel renders an empty shell first**; block 4 waits until its `h3`, the `main h1` name and the follower line all exist. Unknown logins show "Sorry. Unless you've got a time machine, that content is unavailable."
 - **Transient shell pages:** 2 of 15 live channels came back HTTP 200 as a ~217 KB page with no meta tags and no JSON-LD; 4 refetches of each a minute later were all normal. Block 3 refetches (5, 10, 20 s) and raises if the profile never appears. It only reports "no such channel" on a positive marker: unknown logins return HTTP 200 with `og:title` = `Twitch` and `<meta name="robots" content="noindex">`, while real channels have `robots` = `index` and the shell page has no meta at all.
 - **Consent:** the cloud browser showed a "Cookies & Ads Choices" button; it did not block cards or about pages, so the blocks leave it alone.
-- **Pacing:** blocks use 2 s between scroll steps and page loads and 1 request/s for plain HTTP. No 429 or challenge was seen at that rate. Block 3 backs off on 429/5xx under one 120 s deadline per channel that also covers the shell refetches, never sleeps when the next try would miss it, and then raises; a 403 raises at once.
-- **Bot checks:** none appeared, so the challenge check is generic (captcha iframes, "verify you are human" style text in the browser, the `<title>` in block 3). On a hit every block raises and stops; do not retry, rotate sessions or change the request to get past it.
+- **Pacing:** blocks use 2 s between scroll steps and page loads and 1 request/s for plain HTTP. No 429 or challenge was seen at that rate. Block 3 backs off on 429/5xx under one 120 s deadline per channel that also covers the shell refetches, never sleeps when the next try would miss it, and then raises; a 403 raises at once. Every response body, error statuses included, is checked for a bot check before any retry.
+- **Bot checks:** none appeared, so the challenge check is generic (captcha iframes, "verify you are human" style text in the browser; in block 3, specific challenge-vendor markers and that text anywhere in the body of any response, 200 or error). Block 3 does not match a bare `captcha`: all 4 saved channel and directory HTML pages contain it twice as a script-chunk name (`features.auth.components.captcha.fun-captcha`). On a hit every block raises and stops; do not retry, rotate sessions or change the request to get past it.
 - **Contact data:** bios, panel text and stream titles are free text and sometimes carry business emails or phone numbers. The blocks mask emails and 9+ digit phone-like numbers (`[email]`, `[phone]`) and drop `mailto:`/`tel:` links before printing.
 
 ## What does not work

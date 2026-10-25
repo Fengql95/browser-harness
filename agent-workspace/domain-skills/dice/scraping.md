@@ -9,7 +9,7 @@ robots.txt (fetched 2026-10-24) disallows `/jobs?q*`, `/jobsearch/` and `/job` f
 - Search result pages are server-rendered Next.js (App Router). Every page embeds the full result set as JSON inside `self.__next_f.push([1,"..."])` script strings, under a `"jobList":` key: `data` (20 jobs) + `meta` (`currentPage`, `pageCount`, `totalResults`, facets).
 - Plain HTTP works: a truthful custom User-Agent got HTTP 200 and the full JSON on every request in these runs (about 100 page requests, mostly at a 2 s pace, no 429, no challenge, no consent banner).
 - Page size is fixed at 20. Pages past 25 are clamped: `?page=26` and `?page=46` both returned `currentPage: 25`. So one search yields at most 500 jobs even when `pageCount` says 46. Treat that as a hard stop.
-- Relevance order is not stable between requests, so deep pagination repeats and skips some jobs (78-99 unique per 100 slots measured). De-dup on `guid`, and the helpers below return `status: "partial"` with a reason whenever fewer than `totalResults` jobs were collected.
+- Relevance order is not stable between requests, so deep pagination repeats and skips some jobs (78-99 unique per 100 slots measured). De-dup on `guid`, and the helpers below return `status: "partial"` with a reason whenever fewer than `totalResults` jobs were collected or `totalResults` changed between pages.
 - `/job-detail/<guid>` pages carry a schema.org `JobPosting` JSON-LD block (full description, `validThrough`, postal address).
 - The browser path works too (same JSON, read from the inline scripts), but it is not needed for logged-out search.
 
@@ -83,6 +83,10 @@ def fetch(url, attempts=4, deadline_s=DEADLINE_S):
             raise TimeoutError(f"{deadline_s}s deadline reached for {url} after {i + 1} attempts ({err})")
         time.sleep(DELAYS[i])
 
+def is_count(v):
+    """A real non-negative int. bool is an int subclass, so True/False are rejected too."""
+    return type(v) is int and v >= 0
+
 def parse_joblist(html):
     """Concatenate the RSC strings, decode the object after "jobList":, validate it."""
     chunks = re.findall(r'self\.__next_f\.push\(\[1,(".*?")\]\)</script>', html, re.S)
@@ -93,8 +97,8 @@ def parse_joblist(html):
     jl = json.JSONDecoder().raw_decode(flight, i + len('"jobList":'))[0]
     meta, data = jl.get("meta"), jl.get("data")
     if (not isinstance(meta, dict) or not isinstance(data, list)
-            or any(not isinstance(meta.get(k), int) for k in ("currentPage", "pageCount", "totalResults"))):
-        raise RuntimeError("jobList without data/meta counts - layout change, stop")
+            or any(not is_count(meta.get(k)) for k in ("currentPage", "pageCount", "totalResults"))):
+        raise RuntimeError("jobList without valid data/meta counts - layout change, stop")
     bad = sum(1 for j in data if not (j.get("guid") and j.get("title") and j.get("detailsPageUrl")))
     if bad:
         raise RuntimeError(f"{bad} jobs missing guid/title/detailsPageUrl - layout change, stop")
@@ -115,16 +119,19 @@ def normalize(j):
     }
 
 def search_dice(keyword=None, location=None, max_pages=3, filters=None):
-    """Returns (jobs, info). info["status"] is "complete" only when at least
-    totalResults unique jobs were collected; otherwise "partial" with a reason."""
+    """Returns (jobs, info). info["status"] is "complete" only when totalResults
+    stayed the same on every page and at least that many unique jobs were
+    collected; otherwise "partial" with a reason."""
     if max_pages < 1:
         raise ValueError("max_pages must be >= 1")
-    jobs, seen, meta, reason = [], set(), {}, None
+    jobs, seen, meta, reason, totals, counts = [], set(), {}, None, [], []
     for page in range(1, min(max_pages, MAX_PAGE) + 1):
         if page > 1:
             time.sleep(PAUSE_S)
         jl = parse_joblist(fetch(search_url(keyword, location, page, filters)))
         meta = jl["meta"]
+        totals.append(meta["totalResults"])
+        counts.append(meta["pageCount"])
         if meta["currentPage"] != page:      # count shrank or clamp: stop, do not guess
             reason = f"asked for page {page}, Dice returned page {meta['currentPage']}"
             break
@@ -135,14 +142,17 @@ def search_dice(keyword=None, location=None, max_pages=3, filters=None):
         if page >= meta["pageCount"]:
             break
     fetched = page if reason is None else page - 1
-    total, pages = meta["totalResults"], meta["pageCount"]
-    if len(jobs) >= total:
+    # Largest count seen, so a total that shrank mid-crawl cannot make a short crawl look complete.
+    total, pages = max(totals), max(counts)
+    if len(jobs) >= total and min(totals) == total:
         status, reason = "complete", None
     else:
         status = "partial"
         if reason is None and pages > fetched:
             reason = ("Dice 25-page cap (500 jobs max per search)" if fetched == MAX_PAGE
                       else f"max_pages={max_pages} reached")
+        if reason is None and min(totals) != total:
+            reason = f"totalResults changed during the crawl ({min(totals)} to {total})"
         reason = reason or "relevance order reshuffled between pages (repeats/skips)"
     return jobs, {"status": status, "reason": reason, "total": total, "page_count": pages,
                   "pages_fetched": fetched, "collected": len(jobs)}
@@ -164,11 +174,11 @@ Output observed (trimmed):
 {'status': 'partial', 'reason': 'max_pages=3 reached', 'total': 132, 'page_count': 7, 'pages_fetched': 3, 'collected': 60}
 {"title": "Python Developer - Houston, TX (Locals only)", "company": "Source Mantra Inc", "location": "Houston, Texas, USA", "workplace": "On-Site", "employment_type": "Third Party, Contract", "posted": "2026-10-23T19:05:49Z", "salary": "$$65 - $70", "url": "https://www.dice.com/job-detail/7a92a6a3-2b6f-49be-9f2a-c6737ea95e2e", "guid": "7a92a6a3-2b6f-49be-9f2a-c6737ea95e2e"}
 {"title": "Python Developer", "company": "Mindlance", "location": "Houston, Texas, USA", "workplace": "On-Site", "employment_type": "Contract", "posted": "2026-10-15T21:57:49Z", "salary": "50 - 58", ...}
-{"title": "Python Developer - AWS, AI, LLM -  ZL", "company": "SES", "location": null, "workplace": "Remote", "employment_type": "Full-time", ...}
-remote devops: {'status': 'partial', 'reason': 'max_pages=2 reached', 'total': 239, 'page_count': 12, 'pages_fetched': 2, 'collected': 39}
+{"title": "Senior AWS Python Developer / Ops Engineer", "company": "EPAM Systems", "location": null, "workplace": "Remote", "employment_type": "Full-time", ...}
+remote devops: {'status': 'partial', 'reason': 'max_pages=2 reached', 'total': 239, 'page_count': 12, 'pages_fetched': 2, 'collected': 40}
 ```
 
-`collected` is 39, not 40, because page 2 repeated one page-1 job. With `max_pages=30` the same Houston search fetched all 7 pages and stopped at `pageCount`: 132 of 132 jobs on 2026-10-23, 131 of 132 on 2026-10-24 (returned as `status: "partial"`, reason `relevance order reshuffled between pages`). Never report a `partial` result as the full set.
+`collected` for the remote DevOps search was 40 on this run and 39 on an earlier 2026-10-24 run, where page 2 repeated one page-1 job. With `max_pages=30` the same Houston search fetched all 7 pages and stopped at `pageCount`: 132 of 132 jobs on 2026-10-23 and on the last 2026-10-24 run (`status: "complete"`, `totalResults` 132 on every page), 131 of 132 on an earlier 2026-10-24 run (returned as `status: "partial"`, reason `relevance order reshuffled between pages`). Never report a `partial` result as the full set.
 
 URL shapes that returned 200 with a `jobList`:
 
@@ -225,10 +235,13 @@ def open_page(url, first=False):
     if js(IS_CHALLENGE):
         raise RuntimeError(f"challenge/block page at {url} - stop and tell the user, do not retry")
 
+def is_count(v):
+    return type(v) is int and v >= 0      # rejects bools and negatives
+
 def browser_search(keyword=None, location=None, max_pages=2):
     if max_pages < 1:
         raise ValueError("max_pages must be >= 1")
-    rows, seen, meta, page, reason = [], set(), {}, 0, None
+    rows, seen, meta, page, reason, totals, counts = [], set(), {}, 0, None, [], []
     for page in range(1, min(max_pages, 25) + 1):
         if page > 1:
             time.sleep(2)
@@ -237,12 +250,14 @@ def browser_search(keyword=None, location=None, max_pages=2):
         if not raw:
             raise RuntimeError("no jobList on page - stop and inspect (layout change or block page)")
         jl = json.JSONDecoder().raw_decode(raw)[0]
-        meta, data = jl.get("meta") or {}, jl.get("data")
-        if not isinstance(data, list) or any(not isinstance(meta.get(k), int)
-                                             for k in ("currentPage", "pageCount", "totalResults")):
-            raise RuntimeError("jobList without data/meta counts - layout change, stop")
+        meta, data = jl.get("meta"), jl.get("data")
+        if (not isinstance(meta, dict) or not isinstance(data, list)
+                or any(not is_count(meta.get(k)) for k in ("currentPage", "pageCount", "totalResults"))):
+            raise RuntimeError("jobList without valid data/meta counts - layout change, stop")
         if any(not (j.get("guid") and j.get("title") and j.get("detailsPageUrl")) for j in data):
             raise RuntimeError("job without guid/title/detailsPageUrl - layout change, stop")
+        totals.append(meta["totalResults"])
+        counts.append(meta["pageCount"])
         if meta["currentPage"] != page:
             reason = f"asked for page {page}, Dice returned page {meta['currentPage']}"
             page -= 1
@@ -257,13 +272,15 @@ def browser_search(keyword=None, location=None, max_pages=2):
                          "posted": j.get("postedDate"), "url": j["detailsPageUrl"]})
         if page >= meta["pageCount"]:
             break
-    total = meta.get("totalResults", 0)
-    if len(rows) >= total:
+    total, pages = max(totals), max(counts)   # largest seen: a shrinking total cannot fake "complete"
+    if len(rows) >= total and min(totals) == total:
         status, reason = "complete", None
     else:
         status = "partial"
-        if reason is None and meta["pageCount"] > page:
+        if reason is None and pages > page:
             reason = "Dice 25-page cap" if page == 25 else f"max_pages={max_pages} reached"
+        if reason is None and min(totals) != total:
+            reason = f"totalResults changed during the crawl ({min(totals)} to {total})"
         reason = reason or "relevance order reshuffled between pages (repeats/skips)"
     return rows, {"status": status, "reason": reason, "total": total,
                   "pages_fetched": page, "collected": len(rows)}
@@ -277,12 +294,12 @@ for r in rows[:3]:
 Output observed (trimmed):
 
 ```
-{'status': 'partial', 'reason': 'max_pages=2 reached', 'total': 1587, 'pages_fetched': 2, 'collected': 35}
+{'status': 'partial', 'reason': 'max_pages=2 reached', 'total': 1588, 'pages_fetched': 2, 'collected': 40}
 {"title": "DevOps Engineer", "company": "Dexian DISYS", "location": "Charlotte, North Carolina, USA", "employment_type": "Contract", "posted": "2026-10-15T20:11:32Z", "url": "https://www.dice.com/job-detail/be07b58c-3595-4790-a5c4-fed0892f9c8c"}
-{"title": "DEVOPS ENGINEER", "company": "AaraTechnologies Inc", "location": "Maryland City, Maryland, USA", "employment_type": "Contract", ...}
+{"title": "DevOps Engineer", "company": "TechNix LLC", "location": "Raleigh, North Carolina, USA", "employment_type": "Contract, Third Party", ...}
 ```
 
-Not 40: across runs this collected 38, 28 (2026-10-23) and 35 (2026-10-24) unique jobs, because the relevance order reshuffles between requests and page 2 repeats some page-1 jobs. See "Unstable order" under Gotchas.
+This run got all 40 slots unique, but across runs the same call collected 38, 28 (2026-10-23) and 35 (2026-10-24) unique jobs, because the relevance order reshuffles between requests and page 2 repeats some page-1 jobs. See "Unstable order" under Gotchas.
 
 DOM fallback if the JSON ever disappears: each result is `[data-testid="job-card"][role="article"]` inside `role="list"` with `aria-label="Job search results"`; the card link `a[data-testid="job-search-job-card-link"]` has `href="/job-detail/<guid>"` and `aria-label="View Details for <title> (<id>)"`. Card text only has relative dates ("Yesterday", "2d ago"), so prefer the JSON.
 
@@ -397,7 +414,7 @@ JSON-LD keys seen: `title, datePosted, validThrough, employmentType, hiringOrgan
 - Unstable order: results are always sorted by `relevance` and the order reshuffles between requests, so consecutive pages repeat some jobs and skip others. Unique jobs over pages 1-5 (100 slots) measured on 2026-10-23: "Python Developer" 99, "Data Engineer" in Chicago 91, "DevOps Engineer" 89, "DevOps Engineer" + `l-Remote` 78. Reloading the same page 2 returned only 8 of the same 20 jobs. Small result sets came back nearly or fully complete (Houston "Python Developer": 132 of 132 over 7 pages on 2026-10-23, 131 of 132 on 2026-10-24). `sortBy=date`, `sort=date`, `sortBy=postedDate` were all ignored (`meta.sortBy` stayed `relevance`). Always de-dup on `guid` and report `len(jobs)` against `totalResults` instead of assuming full coverage.
 - The same title can be posted twice under different `guid`s (seen for one recruiter); those are separate postings, keep both.
 - `l-Remote` does not filter to remote jobs (top hits were On-Site); use `filters.workplaceTypes=Remote`.
-- Counts drift between requests (918 vs 919 total within minutes) because postings update continuously.
+- Counts drift between requests (918 vs 919 total within minutes) because postings update continuously. Both search helpers keep the largest `totalResults` seen and return `status: "partial"` (reason `totalResults changed during the crawl`) when it changed between pages, so a shrinking count never turns a short crawl into "complete".
 - No cookie/consent banner appeared on these pages in the cloud browser (US). No region redirect seen.
 - Polite pacing: 2 s between pages was used for the whole run without any 429. `fetch` retries 429/5xx and network errors only inside one 120 s deadline; a 403, a challenge page or a page without `jobList` raises at once. Stop there and tell the user; do not retry around it or change the User-Agent.
 

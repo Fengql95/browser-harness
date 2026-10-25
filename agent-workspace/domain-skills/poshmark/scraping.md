@@ -8,7 +8,7 @@ robots.txt (fetched 2026-10-24) disallows `/search`, `/api`, `/listings` and `/u
 
 - Brand and category browse pages (`/brand/Levi's-Women-Jeans`, `/category/Men-Shoes`) are server-rendered. Every page embeds `window.__INITIAL_STATE__` with 48 full listing objects, plus a JSON-LD `ItemList` with the 48 canonical listing URLs.
 - Plain HTTP with an honest User-Agent returned HTTP 200 for every browse page tried (about 50 requests, 2 s apart, no 429, no captcha). No browser needed for the main task.
-- Pagination is `?max_id=N` (N = page number). This is the URL the site's own "Next" button produces. With `sort_by=added_desc`, consecutive pages shared 0 or 1 IDs (new listings push rows onto the next page); the code de-duplicates by `id`.
+- Pagination is `?max_id=N` (N = page number). This is the URL the site's own "Next" button produces. With `sort_by=added_desc`, consecutive pages shared 0 to 2 IDs (new listings push rows onto the next page); the code de-duplicates by `id`.
 - Filters are plain query params: `size[]=28`, `price[]=25-50`, `brand[]=Nike` (on category pages), `sort_by=...`, `availability=available`.
 - Results are capped at 105 pages (about 5000 rows): `more.total` reports 5000 for any large result set. On `/brand/Levi's-Women-Jeans?sort_by=added_desc`, page 104 had `is_next_max_id_present: true`, page 105 had 48 rows and `false`, and pages 106, 107, 120 and 200 returned 0 rows. With the default sort, pages 106, 120 and 200 still returned 48 rows each (no overlap with page 105) but with `false`, and default-sort rows reshuffle between requests anyway. Treat the cap as a hard stop: stop when `has_next` is false, and when `total` is 5000 the code returns status `truncated_site_cap` instead of `complete`. Hitting your own `max_pages` while `has_next` is true returns `truncated_max_pages`.
 - Keyword search lives under `/search`, which robots.txt disallows, so it was not requested. Use brand/category pages plus filters, then filter titles locally if you need keywords.
@@ -18,7 +18,7 @@ robots.txt (fetched 2026-10-24) disallows `/search`, `/api`, `/listings` and `/u
 ### 1. Plain HTTP, multi-page, with filters (main method)
 
 ```python
-import gzip, json, re, time, urllib.error, urllib.parse, urllib.request
+import gzip, json, math, re, socket, time, urllib.error, urllib.parse, urllib.request
 
 UA = "poshmark-listing-export/1.0 (python-urllib; personal research script)"
 BASE = "https://poshmark.com"
@@ -31,8 +31,23 @@ def redact(text):
     """Titles are seller-written free text: mask any email address or phone number in them."""
     return PHONE.sub("[phone]", EMAIL.sub("[email]", text))
 
+def read_body(r, deadline):
+    """Read in chunks, each socket wait capped at the time left, so a server that trickles bytes cannot outlive the deadline."""
+    sock, chunks = getattr(getattr(r.fp, "raw", None), "_sock", None), []
+    while True:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise TimeoutError("deadline passed while reading the response body")
+        if sock is not None:
+            sock.settimeout(min(30, left))
+        chunk = r.read1(65536)
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+
 def fetch(url, budget_s=120):
-    """GET with capped exponential backoff under ONE deadline. Raises on 403/404 or when the budget is spent."""
+    """GET with capped exponential backoff under ONE deadline that also covers reading the body.
+    Raises on 403/404 or when the budget is spent."""
     deadline, delay, attempt = time.monotonic() + min(budget_s, 120), 5, 0
     while True:
         attempt += 1
@@ -41,7 +56,7 @@ def fetch(url, budget_s=120):
             req = urllib.request.Request(url, headers={
                 "User-Agent": UA, "Accept-Encoding": "gzip", "Accept-Language": "en-US,en;q=0.9"})
             with urllib.request.urlopen(req, timeout=max(0.1, min(30, remaining))) as r:
-                body = r.read()
+                body = read_body(r, deadline)
                 if r.headers.get("Content-Encoding") == "gzip":
                     body = gzip.decompress(body)
                 return r.geturl(), body.decode("utf-8")
@@ -49,7 +64,7 @@ def fetch(url, budget_s=120):
             if e.code not in RETRYABLE:
                 raise
             err = e
-        except (urllib.error.URLError, TimeoutError) as e:
+        except (urllib.error.URLError, TimeoutError, socket.timeout, ConnectionError) as e:   # socket.timeout: Python < 3.10
             err = e
         if time.monotonic() + delay >= deadline:   # no sleep after the last attempt
             raise RuntimeError(f"giving up on {url} after {attempt} attempts: {err}")
@@ -76,16 +91,9 @@ def parse_page(html):
                  if k.startswith("$_") and isinstance(v, dict) and "gridData" in v), None)
     if grid is None:
         raise RuntimeError("no gridData module in __INITIAL_STATE__")
-    urls = {}
-    for block in re.findall(r'<script[^>]*application/ld\+json[^>]*>(.*?)</script>', html, re.S):
-        d = json.loads(block)
-        els = d.get("itemListElement") if d.get("@type") == "ItemList" else None
-        if isinstance(els, list):             # it is the integer 0 on an empty page
-            for el in els:
-                urls[el["url"].rsplit("-", 1)[-1]] = el["url"]
     def money(m):
         v = float((m or {}).get("val") or 0)
-        return v or None          # 0.0 means "not set" (common for original price)
+        return v if math.isfinite(v) and v > 0 else None   # 0.0 means "not set"; NaN/inf/negative rejected
     rows = []
     for it in grid.get("data") or []:
         bad = [f for f, ok in (("id", re.fullmatch(r"[0-9a-f]{24}", str(it.get("id") or ""))),
@@ -104,13 +112,17 @@ def parse_page(html):
             "department": (it.get("department") or {}).get("display"),
             "category": it.get("category"),
             "status": (it.get("inventory") or {}).get("status"),
-            "url": urls.get(it["id"], f"{BASE}/listing/{it['id']}"),
+            # ID-only permalink (301s to /listing/<Title-Slug>-<id>); the slug repeats the seller-written title.
+            "url": f"{BASE}/listing/{it['id']}",
         })
     more = grid.get("more") or {}
     return rows, more.get("total"), bool(more.get("is_next_max_id_present"))
 
-def query_items(u):
-    return sorted(urllib.parse.parse_qsl(urllib.parse.urlparse(u).query, keep_blank_values=True))
+def same_url(a, b):
+    """Same host, path and query (order and %-encoding ignored), so a redirect or a different page is never read."""
+    pa, pb = urllib.parse.urlparse(a), urllib.parse.urlparse(b)
+    q = lambda p: sorted(urllib.parse.parse_qsl(p.query, keep_blank_values=True))
+    return (pa.netloc, urllib.parse.unquote(pa.path), q(pa)) == (pb.netloc, urllib.parse.unquote(pb.path), q(pb))
 
 def scrape(path, filters=None, max_pages=3, pause_s=2.0):
     """Returns (rows, status). status is "complete", "truncated_max_pages" (more pages exist)
@@ -119,20 +131,18 @@ def scrape(path, filters=None, max_pages=3, pause_s=2.0):
     for page in range(1, max_pages + 1):
         url = browse_url(path, filters, page)
         final, html = fetch(url)
-        fp = urllib.parse.urlparse(final)
-        if fp.netloc != "poshmark.com" or not fp.path.startswith(("/brand/", "/category/")):
-            raise RuntimeError(f"redirected away from the listings page: {final}")
-        if query_items(final) != query_items(url):
-            raise RuntimeError(f"server changed the query: asked {url}, got {final}")
+        if not same_url(final, url):
+            raise RuntimeError(f"server sent us elsewhere: asked {url}, got {final}; "
+                               "call scrape() again with that path if it is the page you want")
         rows, total, has_next = parse_page(html)
+        if not rows and (has_next or total):
+            raise RuntimeError(f"page {page} has 0 rows but total={total}, next={has_next}: {final}")
         new = [r for r in rows if r["id"] not in seen]
         seen.update(r["id"] for r in new)
         out.extend(new)
         print(f"page {page}: {len(rows)} rows, {len(new)} new, total={total}, next={has_next}")
         if not has_next:
             return out, ("truncated_site_cap" if (total or 0) >= SITE_CAP_TOTAL else "complete")
-        if not rows:
-            raise RuntimeError(f"page {page} has 0 rows but has_next is true: {final}")
         if page == max_pages:
             return out, "truncated_max_pages"
         time.sleep(pause_s)
@@ -146,6 +156,11 @@ for r in listings[:3]:
 
 empty, status = scrape("brand/Zzqxnotabrand-Women-Jeans")
 print(len(empty), "listings for an unknown brand, status:", status)
+
+try:   # this slug 301s to a different canonical path, so scrape() refuses it and names the target
+    scrape("brand/Lululemon_Athletica-Women-Pants", {"sort_by": "added_desc"}, max_pages=1)
+except RuntimeError as e:
+    print("refused:", e)
 ```
 
 Real output (trimmed):
@@ -155,25 +170,24 @@ page 1: 48 rows, 48 new, total=5000, next=True
 page 2: 48 rows, 48 new, total=5000, next=True
 page 3: 48 rows, 48 new, total=5000, next=True
 144 listings, status: truncated_max_pages
-{"id": "6add5dea1921253821f65fea", "title": "Levi's Ribcage Straight Ankle Jeans Distressed Blue Waist 28", "brand": "Levi's", "size": "US 28", "price": 28.0, "original_price": 110.0, "currency": "USD", "department": "Women", "category": "Denim", "status": "available", "url": "https://poshmark.com/listing/Levis-Ribcage-Straight-Ankle-Jeans-Distressed-Blue-Waist-28-6add5dea1921253821f65fea"}
+{"id": "6add62f04adcb3f097bb212d", "title": "Levi’s Ribcage Straight Ankle High Waisted Jeans in Space Ripple size 28", "brand": "Levi's", "size": "US 28", "price": 44.0, "original_price": 98.0, "currency": "USD", "department": "Women", "category": "Denim", "status": "available", "url": "https://poshmark.com/listing/6add62f04adcb3f097bb212d"}
 ...
 page 1: 0 rows, 0 new, total=0, next=False
 0 listings for an unknown brand, status: complete
+refused: server sent us elsewhere: asked https://poshmark.com/brand/Lululemon_Athletica-Women-Pants?sort_by=added_desc, got https://poshmark.com/brand/lululemon_athletica-Women-Pants_&_Jumpsuits?sort_by=added_desc; call scrape() again with that path if it is the page you want
 ```
 
 `truncated_max_pages` is expected here: `max_pages=3` stopped the run while `has_next` was still true.
 
-On an empty result page the JSON-LD `ItemList.itemListElement` is the integer `0`, not a list; `parse_page` checks for that.
-
-A row with an original price set (from `brand/lululemon_athletica-Women-Pants_&_Jumpsuits`, where 35 of 96 rows had one):
+A row with an original price set (from `brand/lululemon_athletica-Women-Pants_&_Jumpsuits` with `sort_by=added_desc`, where 23 of 96 rows on 2 pages had one):
 
 ```
-{"id": "6ad25d00571a7e8a93781a71", "title": "Lululemon Align High Rise Leggings 28” - Creamy Mint", "brand": "lululemon athletica", "size": "US 6", "price": 35.0, "original_price": 98.0, "currency": "USD", "department": "Women", "category": "Pants", "status": "available", "url": "https://poshmark.com/listing/Lululemon-Align-High-Rise-Leggings-28-Creamy-Mint-6ad25d00571a7e8a93781a71"}
+{"id": "6add6586cbbea541a1f1443a", "title": "Lululemon License to Train High-Rise Pant Army Green Casual Women’s Active Small", "brand": "lululemon athletica", "size": "US S", "price": 85.0, "original_price": 128.0, "currency": "USD", "department": "Women", "category": "Pants", "status": "available", "url": "https://poshmark.com/listing/6add6586cbbea541a1f1443a"}
 ```
 
 ### 2. Same data from a browser tab (when you are already driving one)
 
-The hydrated page keeps `window.__INITIAL_STATE__`, so the browser path reads the same JSON instead of scraping tiles. The JSON-LD blocks are not in the live DOM after hydration (0 `ld+json` scripts in a fresh cloud browser, while a same-origin refetch of the HTML had them), so canonical URLs come from the tile links `a[href^="/listing/"]`. The code waits until every listing ID has a rendered tile link.
+The hydrated page keeps `window.__INITIAL_STATE__`, so the browser path reads the same JSON instead of scraping tiles. `open_page` waits until the tab is on exactly the requested URL (query included) and refuses a server redirect to a different path at once.
 
 ```python
 import json, time, urllib.parse
@@ -186,15 +200,8 @@ EXTRACT = r"""(() => {
   if (s.showCaptcha) return {error: 'captcha'};
   const mod = Object.keys(s).find(k => k.startsWith('$_') && s[k] && s[k].gridData);
   if (!mod) return {pending: 'no gridData yet'};
-  const g = s[mod].gridData, data = g.data || [], urls = {};
-  // Canonical URLs come from the rendered tile links (the JSON-LD ItemList is gone from the live DOM).
-  document.querySelectorAll('a[href^="/listing/"]').forEach(a => {
-    const h = a.getAttribute('href').split('?')[0];
-    urls[h.split('-').pop()] = location.origin + h;
-  });
-  const missing = data.filter(it => !urls[it.id]).length;
-  if (missing) return {pending: `${missing}/${data.length} tiles not rendered yet`};
-  const money = m => { const v = parseFloat((m || {}).val || '0'); return v || null; };
+  const g = s[mod].gridData, data = g.data || [];
+  const money = m => { const v = parseFloat((m || {}).val || '0'); return Number.isFinite(v) && v > 0 ? v : null; };
   const bad = data.find(it => !/^[0-9a-f]{24}$/.test(it.id || '') || !it.title || !money(it.price_amount));
   if (bad) return {error: `listing ${bad.id} is missing id/title/price`};
   // Titles are seller-written free text: mask any email address or phone number.
@@ -206,7 +213,8 @@ EXTRACT = r"""(() => {
       id: it.id, title: redact(it.title), brand: it.brand,
       size: (it.size_obj || {}).display_with_size_system || it.size,
       price: money(it.price_amount), original_price: money(it.original_price_amount),
-      url: urls[it.id],
+      // ID-only permalink (301s to /listing/<Title-Slug>-<id>); the slug repeats the seller-written title.
+      url: location.origin + '/listing/' + it.id,
     })),
   };
 })()"""
@@ -220,10 +228,15 @@ def same_url(a, b):
 def open_page(url, first=False, settle_s=20):
     new_tab(url) if first else goto_url(url)
     wait_for_load()
+    want = urllib.parse.urlparse(url)
     deadline, href, data = time.monotonic() + settle_s, None, None
-    while time.monotonic() < deadline:       # one deadline for the URL, state and tiles to settle
-        href = js("location.href")
-        if same_url(href or "", url):
+    while time.monotonic() < deadline:       # one deadline for the URL and state to settle
+        href = js("location.href") or ""
+        got = urllib.parse.urlparse(href)
+        if got.netloc == want.netloc and urllib.parse.unquote(got.path) != urllib.parse.unquote(want.path):
+            # pagination only changes the query, so a different path on this host is a server redirect
+            raise RuntimeError(f"redirected: asked {url}, got {href}; open that URL instead if it is the page you want")
+        if same_url(href, url):
             data = js(EXTRACT)
             if data and data.get("error"):
                 raise RuntimeError(f"extraction failed on {href}: {data['error']}")
@@ -243,37 +256,45 @@ for page in range(1, MAX_PAGES + 1):
     seen.update(r["id"] for r in new)
     results.extend(new)
     print(f"page {page}: {len(data['rows'])} rows, {len(new)} new, next={data['has_next']}")
+    if not data["rows"] and (data["has_next"] or data["total"]):
+        raise RuntimeError(f"page {page} has 0 rows but total={data['total']}, next={data['has_next']}")
     if not data["has_next"]:
         status = "truncated_site_cap" if (data["total"] or 0) >= SITE_CAP_TOTAL else "complete"
         break
-    if not data["rows"]:
-        raise RuntimeError(f"page {page} has 0 rows but has_next is true")
     if page == MAX_PAGES:
         status = "truncated_max_pages"
         break
     time.sleep(2)
 print(len(results), "listings, status:", status)
 print(json.dumps(results[:2], indent=1, ensure_ascii=False))
+
+time.sleep(2)
+try:   # this slug 301s to a different canonical path, so open_page() refuses it and names the target
+    open_page("https://poshmark.com/brand/Lululemon_Athletica-Women-Pants?sort_by=added_desc")
+except RuntimeError as e:
+    print("refused:", e)
 ```
 
 Real output (trimmed):
 
 ```
 page 1: 48 rows, 48 new, next=True
-page 2: 48 rows, 48 new, next=True
-page 3: 48 rows, 48 new, next=True
-144 listings, status: truncated_max_pages
+page 2: 48 rows, 46 new, next=True
+page 3: 48 rows, 47 new, next=True
+141 listings, status: truncated_max_pages
 [
  {
-  "id": "6add5f6d06c773fcadec8423",
-  "title": "Size 12 - Nike Zoom KD 12 EYBL Peach Jam",
+  "id": "6add640441ae6654d547f803",
+  "title": "Nike Men’s Black Air Force 1 Sneakers with Silver Swoosh",
   "brand": "Nike",
-  "size": "US 12",
-  "price": 187,
+  "size": "US 9",
+  "price": 65,
   "original_price": null,
-  "url": "https://poshmark.com/listing/Size-12-Nike-Zoom-KD-12-EYBL-Peach-Jam-6add5f6d06c773fcadec8423"
+  "url": "https://poshmark.com/listing/6add640441ae6654d547f803"
  },
  ...
+]
+refused: redirected: asked https://poshmark.com/brand/Lululemon_Athletica-Women-Pants?sort_by=added_desc, got https://poshmark.com/brand/lululemon_athletica-Women-Pants_&_Jumpsuits?sort_by=added_desc; open that URL instead if it is the page you want
 ```
 
 ## URL patterns and filters (all observed)
@@ -290,7 +311,7 @@ page 3: 48 rows, 48 new, next=True
 | `?brand[]=Nike` | brand filter on `/category/...` pages |
 | `?availability=available` | added by the UI; rows had `inventory.status == "available"` |
 | Unknown brand slug, or a filter with no matches (`/brand/Patagonia?size[]=ZZ999`) | 200 with 0 rows, `total: 0`, and JSON-LD `itemListElement: 0` (not a 404), so check for empty results |
-| `/brand/Lululemon_Athletica-Women-Pants` | 301 to `/brand/lululemon_athletica-Women-Pants_&_Jumpsuits` (urllib follows it) |
+| `/brand/Lululemon_Athletica-Women-Pants?sort_by=added_desc` | 301 to `/brand/lululemon_athletica-Women-Pants_&_Jumpsuits?sort_by=added_desc` (query kept). Both blocks refuse it because the path changed and print the target; call again with that path |
 | `/listing/<id>` | 301 to the canonical `/listing/<Title-Slug>-<id>` URL |
 
 ## Fields
@@ -307,7 +328,7 @@ page 3: 48 rows, 48 new, next=True
 | `department` | `department.display` | `"Women"`, `"Men"`, ... |
 | `category` | `category` | e.g. `"Denim"`, `"Pants"` |
 | `status` | `inventory.status` | `"available"` |
-| `url` | HTTP: JSON-LD `ItemList.itemListElement[].url`, matched by ID. Browser: tile link `a[href^="/listing/"]` | 48 of 48 matched on every page tested |
+| `url` | built from `id`: `https://poshmark.com/listing/<id>` | 301s to the canonical `/listing/<Title-Slug>-<id>`. The slug is left out because it repeats the seller-written title with spaces turned into `-` and punctuation dropped, so `redact` would not reliably catch contact details in it |
 | (page) `total` | `gridData.more.total` | capped at 5000; `0` on an empty page |
 | (page) `has_next` | `gridData.more.is_next_max_id_present` | false on the last page |
 
@@ -320,11 +341,11 @@ Each listing object also carries seller fields (`creator_username`, `creator_ful
 - `more.next_max_id` is an opaque `ENC_...` token; plain `max_id=N` worked for every page tested and is what the UI uses.
 - `more.total` says 5000 even for narrow filters (`size[]=28&price[]=25-50`), so it means "5000 or more", not an exact count. Page 105 is the last page (`has_next: false`); see the Quick summary for what pages past it return.
 - No consent banner or login wall appeared on browse pages in the cloud browser. `state.ipCountry` was `"US"` and `state.domain` was `"us"`; Poshmark has other country sites, so check `currency` if you run from elsewhere.
-- In the browser, tile counts via `[data-et-name="listing"]` returned 144 for 48 listings, and `a[href^="/listing/"]` returned 96 (two links per tile). Read `__INITIAL_STATE__` for the rows and use the links only to look up URLs by ID.
-- In the browser, the JSON-LD `<script type="application/ld+json">` blocks are absent from the live DOM after hydration, so reading them right after load is a race (a first run returned fallback `/listing/<id>` URLs). Block 2 uses tile links and waits until every ID is matched.
+- In the browser, tile counts via `[data-et-name="listing"]` returned 144 for 48 listings, and `a[href^="/listing/"]` returned 96 (two links per tile). Read `__INITIAL_STATE__` for the rows instead of counting tiles.
+- In the browser, the JSON-LD `<script type="application/ld+json">` blocks are absent from the live DOM after hydration (0 in a fresh cloud browser, while a same-origin refetch of the HTML had them). Neither block reads JSON-LD.
 - Size filter buttons (`#size-28`) are hidden until the Size dropdown is opened, and the choice only applies after clicking Apply. Building the URL directly is simpler.
-- Pacing: 2 s between pages was used throughout with no 429 or captcha. Keep at least that. On any 403 or `showCaptcha: true` the code raises; stop and hand it to a human, do not retry or change the request to get past it. `fetch` retries only 429/5xx/network errors, all under one 120 s deadline per URL, with no sleep after the last attempt.
-- Both blocks refuse a page if the browser or server ended up on a different path or query than requested, or if any listing lacks a 24-hex `id`, a `title` or a nonzero `price`.
+- Pacing: 2 s between pages was used throughout with no 429 or captcha. Keep at least that. On any 403 or `showCaptcha: true` the code raises; stop and hand it to a human, do not retry or change the request to get past it. `fetch` retries only 429/5xx/network errors, all under one 120 s deadline per URL that also bounds reading the body, with no sleep after the last attempt.
+- Both blocks refuse a page if the browser or server ended up on a different path or query than requested, if any listing lacks a 24-hex `id`, a `title` or a finite positive `price`, or if a page has 0 rows while `total` is nonzero or `has_next` is true.
 
 ## What does not work
 

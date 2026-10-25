@@ -27,12 +27,18 @@ if not re.fullmatch(r"https://www\.sephora\.com/(shop|brand)/[a-z0-9-]+", LIST_U
     raise SystemExit("LIST_URL must be https://www.sephora.com/shop/<slug> or /brand/<slug>, no query string")
 
 def load(url, timeout=30):
-    """Navigate the attached tab, wait until location.href is exactly url, return the page's linkStore JSON."""
-    goto_url(url)
+    """Navigate the attached tab once, wait until location.href is exactly url, return the page's linkStore JSON."""
     deadline = time.time() + timeout
+    try:
+        goto_url(url)
+    except TimeoutError:   # the harness stops waiting for Page.navigate after 5 s; the page may still arrive
+        pass
     while True:
-        state = js("""(() => ({href: location.href, title: document.title, ready: document.readyState,
-                       store: document.getElementById('linkStore')?.textContent || ''}))()""") or {}
+        try:
+            state = js("""(() => ({href: location.href, title: document.title, ready: document.readyState,
+                           store: document.getElementById('linkStore')?.textContent || ''}))()""") or {}
+        except TimeoutError:   # page still busy with the navigation
+            state = {}
         if "Access Denied" in (state.get("title") or ""):
             raise SystemExit(f"Sephora's CDN answered {url} with 'Access Denied' (HTTP 403). "
                              "Stop and back off; do not retry in a loop.")
@@ -101,6 +107,9 @@ for page in range(1, MAX_PAGES + 1):
 pages_total = -(-total // size)
 print(listing.get("displayName"), listing.get("categoryId") or listing.get("brandId"), "totalProducts:", total)
 if pages_read >= pages_total:
+    if len(rows) != total:   # e.g. the listing shifted mid-walk: duplicates skipped, other products never seen
+        raise RuntimeError(f"read {pages_read}/{pages_total} pages but got {len(rows)} unique products, "
+                           f"totalProducts={total}; the walk is not complete")
     print(f"status: complete, {pages_read}/{pages_total} pages read, {len(rows)} unique rows")
 else:
     print(f"status: PARTIAL, MAX_PAGES={MAX_PAGES} reached at page {pages_read}/{pages_total}: "
@@ -137,7 +146,7 @@ status: PARTIAL, MAX_PAGES=3 reached at page 3/9: 180 of 519 products, raise MAX
 tab: opened 458A283D2E3A9A0E04151F5C7C8BB2D6
 ```
 
-The `status:` line says whether the walk is complete; with the default `MAX_PAGES = 3` it is `PARTIAL`, so never treat those rows as the whole category. With `MAX_PAGES = 20` the same category walked all 9 pages (`?currentPage=2` to `?currentPage=9`, the last with 39 products) and printed `status: complete, 9/9 pages read, 519 unique rows`, equal to `totalProducts`. `LIST_URL = "https://www.sephora.com/brand/the-ordinary"` printed `status: complete, 2/2 pages read, 67 unique rows` (60 + 7), equal to its `totalProducts`. The block raises instead of returning rows when a page before `totalProducts` is reached comes back empty, a card has no `productId` or `targetUrl`, or the listing has no `totalProducts`.
+The `status:` line says whether the walk is complete; with the default `MAX_PAGES = 3` it is `PARTIAL`, so never treat those rows as the whole category. With `MAX_PAGES = 20` the same category walked all 9 pages (`?currentPage=2` to `?currentPage=9`, the last with 39 products) and printed `status: complete, 9/9 pages read, 519 unique rows`, equal to `totalProducts`. `LIST_URL = "https://www.sephora.com/brand/the-ordinary"` printed `status: complete, 2/2 pages read, 67 unique rows` (60 + 7), equal to its `totalProducts`. The block raises instead of returning rows when a page before `totalProducts` is reached comes back empty, a card has no `productId` or `targetUrl`, the listing has no `totalProducts`, or every page was read but the unique row count differs from `totalProducts`.
 
 ### 2. Product details and all variants (browser, embedded `linkStore` + JSON-LD)
 
@@ -168,12 +177,18 @@ if not href.startswith("https://www.sephora.com/"):
         raise SystemExit("Sephora denied the homepage for this browser. Stop and back off.")
 time.sleep(PAUSE)
 
-goto_url(PRODUCT_URL)
 deadline = time.time() + 30
+try:
+    goto_url(PRODUCT_URL)
+except TimeoutError:   # the harness stops waiting for Page.navigate after 5 s; the page may still arrive
+    pass
 while True:
-    state = js("""(() => ({href: location.href, title: document.title, ready: document.readyState,
-                   store: document.getElementById('linkStore')?.textContent || '',
-                   ld: [...document.querySelectorAll('script[type="application/ld+json"]')].map(s => s.textContent)}))()""") or {}
+    try:
+        state = js("""(() => ({href: location.href, title: document.title, ready: document.readyState,
+                       store: document.getElementById('linkStore')?.textContent || '',
+                       ld: [...document.querySelectorAll('script[type="application/ld+json"]')].map(s => s.textContent)}))()""") or {}
+    except TimeoutError:   # page still busy with the navigation
+        state = {}
     if "Access Denied" in (state.get("title") or ""):
         raise SystemExit(f"'Access Denied' (HTTP 403) for {PRODUCT_URL}. Stop and back off.")
     on_url = re.fullmatch(re.escape(PRODUCT_URL) + r"(\?skuId=\d+)?", state.get("href") or "")
@@ -326,7 +341,8 @@ Product page (`page.product`, block 2):
 
 ## Gotchas
 
-- **`Access Denied` happens, and it is a stop signal.** Observed on 2026-10-23 in the first cloud browser: its first navigation, straight to `/shop/moisturizing-cream-oils-mists`, got Akamai `Access Denied`; 60 s later the homepage loaded fine, but a direct load of the same category right after it was denied again. Later in that same browser (after a few minutes on the site) direct `/shop/`, `/brand/` and `/product/` loads all worked. In 3 later fresh cloud browsers (2026-10-23 and 2026-10-24), block 1 (homepage, 5 s pause, then direct category loads) was never denied. The blocks raise `SystemExit` on any `Access Denied` title; when that happens stop and back off for several minutes rather than retrying or rotating browsers.
+- **`Access Denied` happens, and it is a stop signal.** Observed on 2026-10-23 in the first cloud browser: its first navigation, straight to `/shop/moisturizing-cream-oils-mists`, got Akamai `Access Denied`; 60 s later the homepage loaded fine, but a direct load of the same category right after it was denied again. Later in that same browser (after a few minutes on the site) direct `/shop/`, `/brand/` and `/product/` loads all worked. In 3 later fresh cloud browsers (2026-10-23 and 2026-10-24), block 1 (homepage, 5 s pause, then direct category loads) was never denied; in a 4th (2026-10-24) the homepage loaded and the first `/shop/face-serum` load was denied, and a separate fresh browser started 5 minutes later for this test ran both blocks without a denial. The blocks raise `SystemExit` on any `Access Denied` title; when that happens stop and back off for several minutes rather than retrying or rotating browsers.
+- **Slow navigations.** On 2026-10-24 one `?currentPage=4` load took longer than the harness's 5 s wait for `Page.navigate`, and `goto_url` raised `TimeoutError`. The blocks catch that exception (and a timed-out `js` poll), keep polling the same navigation until their 30 s deadline, and never navigate a second time.
 - **Client-side navigation does not refresh `linkStore`.** Clicking a category link inside the site loads products through a separate XHR and leaves the homepage's `linkStore` in the DOM (`page.home`). The blocks use full page loads (`goto_url`) and check `location.href` plus the page type (`nthCategory` / `nthBrand` / `product.productId`) before reading.
 - **"Show More Products" is not pagination.** On Face Serums it sent no new product request (all 60 of the page were already in `linkStore`); it only renders more tiles. Use `?currentPage=N`.
 - **Lazy-loaded tiles.** The DOM only had 4 to 12 `ProductTile` elements rendered at a time, while `linkStore` had all 60. Do not scrape tiles.

@@ -17,7 +17,7 @@ robots.txt (fetched 2026-10-24) allows the paths used here for `User-agent: *`: 
 
 ### 1. Search results across pages (for sale or rent)
 
-One run loads at most `MAX_LOADS` (12) pages, one load per page. Each page's rows are appended to `OUT` (JSON Lines, in the current directory) as soon as the page is parsed, so a block or error keeps every page already collected. Rows whose `url` is already in `OUT` are skipped, so re-reading a page on resume adds no duplicates. Every page is checked against `totalHomes`: a page before the last must hold 40 homes and the last page at least one, otherwise the run raises (a short or empty page is treated as a possible soft block, never as the end). The run ends with an explicit `COMPLETE`, `PARTIAL` (prints the `START_PAGE` for the next run; resume hours later, not right away) or `TRUNCATED` (the site's 25-page cap, a hard stop) line. A resumed file is stitched from runs hours apart, not one snapshot; delete `OUT` to start over.
+One run loads at most `MAX_LOADS` (12) pages, one load per page. Each page's rows are appended to `OUT` (JSON Lines, in the current directory) as soon as the page is parsed, so a block or error keeps every page already collected. Rows whose `url` is already in `OUT` are skipped, so re-reading a page on resume adds no duplicates. Every page is checked against `totalHomes`: a page before the last must hold 40 homes and the last page at least one, otherwise the run raises (a short or empty page is treated as a possible soft block, never as the end). Each page's number is appended to `PROGRESS` (`OUT` + `.pages`) once its rows are written, and the closing status is computed from that file across all runs, not from this run's page range: `COMPLETE` only when every page from 1 to the last is recorded, otherwise `PARTIAL` (prints how many pages are missing and the `START_PAGE` for the next run; resume hours later, not right away), plus `TRUNCATED` when results exceed the site's 25-page cap (a hard stop). A resumed file is stitched from runs hours apart, not one snapshot; delete `OUT` to start over (the code then discards the old `PROGRESS`).
 
 ```python
 import json, math, os, time
@@ -32,6 +32,7 @@ MAX_LOADS = 12                 # page loads per run; a challenge came at load 16
 PER_PAGE = 40                  # homes on every page before the last (observed)
 SITE_MAX_PAGE = 25             # the site links no page past 25; a hard stop
 OUT = f"trulia_{STATE.lower()}_{CITY.lower().replace(' ', '_')}_{MODE}.jsonl"   # appended, one row per line
+PROGRESS = OUT + ".pages"      # page numbers already written to OUT, one per line
 
 if MODE not in ("sale", "rent"):
     raise ValueError("MODE must be 'sale' or 'rent'")
@@ -98,12 +99,17 @@ def parse_home(h):
         raise RuntimeError(f"listing card without {missing}: page shape changed, re-inspect __NEXT_DATA__")
     return row
 
-seen = set()
+seen, done = set(), set()
 if os.path.exists(OUT):
     with open(OUT) as f:
         seen = {json.loads(line)["url"] for line in f if line.strip()}
+    if os.path.exists(PROGRESS):
+        with open(PROGRESS) as f:
+            done = {int(line) for line in f if line.strip()}
+elif os.path.exists(PROGRESS):
+    os.remove(PROGRESS)   # OUT was deleted: start over
 
-rows, skipped, total, past_end = [], 0, None, False
+rows, skipped, total = [], 0, None
 with open(OUT, "a") as f:
     for page in range(START_PAGE, last_page + 1):
         try:
@@ -128,23 +134,26 @@ with open(OUT, "a") as f:
             print(f"stopped at page {page}: {len(rows)} new rows from this run are in {OUT}; next run START_PAGE = {page}")
             raise
         if page > end:
-            past_end = True
             break
         new = [r for r in page_rows if r["url"] not in seen]
         seen.update(r["url"] for r in new)
         skipped += len(page_rows) - len(new)
         f.write("".join(json.dumps(r) + "\n" for r in new))
         f.flush()
+        with open(PROGRESS, "a") as pf:
+            pf.write(f"{page}\n")
+        done.add(page)
         rows += new
         print(f"page {page}: {len(homes)} homes (totalHomes={total}), {len(new)} new rows appended to {OUT}")
 
 end = min(SITE_MAX_PAGE, math.ceil(total / PER_PAGE))
 cap = SITE_MAX_PAGE * PER_PAGE
+not_read = [p for p in range(1, end + 1) if p not in done]   # from PROGRESS, all runs
 print(f"{len(rows)} new rows this run, {skipped} skipped as already in {OUT}")
-if (past_end or last_page >= end) and total <= cap:
-    print(f"COMPLETE: every page of the {total} results has been read")
-elif not (past_end or last_page >= end):
-    print(f"PARTIAL: read through page {last_page} of {end}; next run START_PAGE = {last_page + 1}")
+if not_read:
+    print(f"PARTIAL: {len(not_read)} of {end} pages not read yet; next run START_PAGE = {not_read[0]}")
+elif total <= cap:
+    print(f"COMPLETE: all {end} result pages ({total} results) are in {OUT}")
 if total > cap:
     print(f"TRUNCATED: the site links only {SITE_MAX_PAGE} pages, so at most {cap} of {total} results are reachable; this cap is a hard stop")
 for r in rows[:2]:
@@ -157,7 +166,7 @@ Output (trimmed):
 page 1: 40 homes (totalHomes=5634), 40 new rows appended to trulia_tx_austin_sale.jsonl
 page 2: 40 homes (totalHomes=5634), 40 new rows appended to trulia_tx_austin_sale.jsonl
 80 new rows this run, 0 skipped as already in trulia_tx_austin_sale.jsonl
-PARTIAL: read through page 2 of 25; next run START_PAGE = 3
+PARTIAL: 23 of 25 pages not read yet; next run START_PAGE = 3
 TRUNCATED: the site links only 25 pages, so at most 1000 of 5634 results are reachable; this cap is a hard stop
 {"address": "Cloverleaf 1657 Plan in Cloverleaf, Austin, TX 78747", "price": "$368,990+", "price_min": 368990, "price_max": null, "beds": "4 Beds", "baths": "2 Baths", "sqft": "1,657 sqft", "type": "HOME_FloorPlan", "url": "https://www.trulia.com/builder-community-plan/cloverleaf-cloverleaf-1657-402160607"}
 {"address": "1900 Barton Springs Rd #2006, Austin, TX 78704", "price": "$419,000", "price_min": 419000, "price_max": 419000, "beds": "1 Bed", "baths": "1 Bath", "sqft": "887 sqft", "type": "HOME_Property", "url": "https://www.trulia.com/home/1900-barton-springs-rd-2006-austin-tx-78704-251032864"}
