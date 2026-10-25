@@ -18,34 +18,38 @@ robots.txt (checked 2026-10-23) has no `User-agent: *` group, so nothing is disa
 Runs as plain `python3` or inside `browser-harness`.
 
 ```python
-import gzip, json, re, threading, time, urllib.error, urllib.parse, urllib.request
+import json, re, subprocess, sys, time, urllib.parse
 
 LISTING_URL = "https://www.ulta.com/shop/makeup/face/foundation"   # any /shop/... or /brand/... listing page
 MAX_PAGES = 3          # 64 products per page; a hard cap: hitting it with pages left prints PARTIAL
 UA = "browser-harness/1.0 (ulta domain skill; plain urllib)"   # truthful client UA
 
+FETCH_CHILD = r"""
+import gzip, json, sys, urllib.error, urllib.request
+url, ua = sys.argv[1], sys.argv[2]
+req = urllib.request.Request(url, headers={"User-Agent": ua, "Accept": "text/html", "Accept-Encoding": "gzip"})
+try:
+    with urllib.request.urlopen(req) as r:
+        status, final, body, enc = r.status, r.geturl(), r.read(), r.headers.get("Content-Encoding")
+except urllib.error.HTTPError as e:
+    status, final, body, enc = e.code, e.geturl() or url, b"", None
+if enc == "gzip":
+    body = gzip.decompress(body)
+sys.stdout.buffer.write(json.dumps({"status": status, "url": final}).encode() + b"\n" + body)
+"""
+
 def get_once(url, budget):
-    """One GET in a daemon thread, so connect + headers + the whole body read finish within `budget` seconds
-    (a server that trickles bytes cannot stretch it). Returns (final_url, body)."""
-    box = {}
-    def work():
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "text/html", "Accept-Encoding": "gzip"})
-            with urllib.request.urlopen(req, timeout=budget) as r:
-                body = r.read()
-                if r.headers.get("Content-Encoding") == "gzip":
-                    body = gzip.decompress(body)
-                box["ok"] = (r.geturl(), body)
-        except BaseException as e:
-            box["err"] = e
-    t = threading.Thread(target=work, daemon=True)
-    t.start()
-    t.join(budget)
-    if t.is_alive():
-        raise TimeoutError(f"no complete response within {budget:.1f} s (request abandoned)")
-    if "err" in box:
-        raise box["err"]
-    return box["ok"]
+    """One GET in a child process that is killed at `budget` s: DNS, connect, headers and a trickled body all
+    stop at the deadline, and no thread or socket outlives the call. Returns (status, final_url, body)."""
+    try:
+        p = subprocess.run([sys.executable, "-I", "-c", FETCH_CHILD, url, UA], capture_output=True, timeout=budget)
+    except subprocess.TimeoutExpired:
+        raise TimeoutError(f"no complete response within {budget:.1f} s (request process killed)")
+    if p.returncode != 0:
+        raise ConnectionError((p.stderr.decode(errors="replace").strip().splitlines() or ["fetch failed"])[-1])
+    head, _, body = p.stdout.partition(b"\n")
+    meta = json.loads(head)
+    return meta["status"], meta["url"], body
 
 def fetch(url, deadline_s=120):
     """GET a page; retry only transient failures. One monotonic deadline covers every try and every wait;
@@ -53,18 +57,19 @@ def fetch(url, deadline_s=120):
     end, waits = time.monotonic() + deadline_s, [5, 15, 30]
     for attempt in range(len(waits) + 1):
         try:
-            final_url, body = get_once(url, min(30, end - time.monotonic()))
-            if final_url != url:
-                raise RuntimeError(f"asked for {url}, was redirected to {final_url}")
-            return body.decode("utf-8")
-        except urllib.error.HTTPError as e:
-            if e.code in (403, 429):
-                raise SystemExit(f"HTTP {e.code} on {url}: Ulta is refusing or rate-limiting. Stop and back off.")
-            if e.code < 500:
-                raise RuntimeError(f"HTTP {e.code} on {url}")
-            err = f"HTTP {e.code}"
-        except (urllib.error.URLError, TimeoutError) as e:
+            status, final_url, body = get_once(url, min(30, end - time.monotonic()))
+        except (ConnectionError, TimeoutError) as e:
             err = repr(e)
+        else:
+            if status in (403, 429):
+                raise SystemExit(f"HTTP {status} on {url}: Ulta is refusing or rate-limiting. Stop and back off.")
+            if 400 <= status < 500:
+                raise RuntimeError(f"HTTP {status} on {url}")
+            if status < 400:
+                if final_url != url:
+                    raise RuntimeError(f"asked for {url}, was redirected to {final_url}")
+                return body.decode("utf-8")
+            err = f"HTTP {status}"
         if attempt == len(waits) or time.monotonic() + waits[attempt] >= end:
             raise RuntimeError(f"giving up on {url} after {attempt + 1} tries: {err}")
         time.sleep(waits[attempt])
@@ -333,10 +338,10 @@ print(json.dumps(rows[:2], indent=1, ensure_ascii=False))
 Observed output (trimmed):
 
 ```
-page 1: 77 cards, 62 kept, 62 total, heading '400+ results for "mascara"'
-page 2: 64 cards, 64 kept, 126 total, heading '400+ results for "mascara"'
-page 3: 64 cards, 64 kept, 190 total, heading '400+ results for "mascara"'
-PARTIAL: stopped at MAX_PAGES=3 with 190 rows; the page still has a Load More link (https://www.ulta.com/search?search=mascara&page=4), heading '400+ results for "mascara"'. Raise MAX_PAGES to collect more.
+page 1: 76 cards, 61 kept, 61 total, heading '400+ results for "mascara"'
+page 2: 64 cards, 64 kept, 125 total, heading '400+ results for "mascara"'
+page 3: 64 cards, 64 kept, 189 total, heading '400+ results for "mascara"'
+PARTIAL: stopped at MAX_PAGES=3 with 189 rows; the page still has a Load More link (https://www.ulta.com/search?search=mascara&page=4), heading '400+ results for "mascara"'. Raise MAX_PAGES to collect more.
 [
  {
   "product_id": "pimprod2020260",
@@ -358,56 +363,61 @@ PARTIAL: stopped at MAX_PAGES=3 with 190 rows; the page still has a Load More li
 ]
 ```
 
-The search heading only says `400+`, so with a Load More link still present the block prints `PARTIAL` and sets `complete = False`; it does not guess a total. Earlier runs of the same query gave 73/73/64, 74/75/64, 74/73/64 (2026-10-23) and 74/77/64 cards (2026-10-24): the sponsored mix and the page 1 organic count vary between loads. On a freshly started browser the first search page took about 16 s before any card rendered, hence the 60 s wait in `load()`. `load()` returns a page only when every card has `sku`, a `/p/` link, `brand` and `name`; cards that never fill in within the 60 s raise (mocked offline: one card with `brand` missing raised after 60.5 s; a card whose `name` filled in on the 4th poll was accepted). It also checks the page for a bot challenge (title or first 500 characters of body text matching "Access Denied", "Just a moment", "Attention Required", "Pardon Our Interruption", or a captcha/challenge iframe) and raises `SystemExit` without retrying; no live page matched, the raise was checked with a mock. Other queries in the 2026-10-24 rerun: `"cushion foundation"` returned 16 cards, 16 kept, heading `16 results for "cushion foundation"`, no next link, `COMPLETE: 16 rows`; a sale card parsed as `"price": "$14.99", "list_price": "$19.99", "on_sale": true`. `"nars"` redirected to `https://www.ulta.com/brand/nars` (block 2 stops and points to block 1). `"zzqxv nonexistent"` redirected to `/search/no-results?...` and printed `no results`.
+The search heading only says `400+`, so with a Load More link still present the block prints `PARTIAL` and sets `complete = False`; it does not guess a total. Earlier runs of the same query gave 73/73/64, 74/75/64, 74/73/64 (2026-10-23) and 74/77/64 and 77/64/64 cards (2026-10-24): the sponsored mix and the page 1 organic count vary between loads. On a freshly started browser the first search page took about 16 s before any card rendered, hence the 60 s wait in `load()`. `load()` returns a page only when every card has `sku`, a `/p/` link, `brand` and `name`; cards that never fill in within the 60 s raise (mocked offline: one card with `brand` missing raised after 60.5 s; a card whose `name` filled in on the 4th poll was accepted). It also checks the page for a bot challenge (title or first 500 characters of body text matching "Access Denied", "Just a moment", "Attention Required", "Pardon Our Interruption", or a captcha/challenge iframe) and raises `SystemExit` without retrying; no live page matched, the raise was checked with a mock. Other queries in the 2026-10-24 rerun: `"cushion foundation"` returned 16 cards, 16 kept, heading `16 results for "cushion foundation"`, no next link, `COMPLETE: 16 rows`; a sale card parsed as `"price": "$14.99", "list_price": "$19.99", "on_sale": true`. `"nars"` redirected to `https://www.ulta.com/brand/nars` (block 2 stops and points to block 1). `"zzqxv nonexistent"` redirected to `/search/no-results?...` and printed `no results`.
 
 ### 3. Product page details (plain HTTP, no browser)
 
 ```python
-import gzip, json, re, threading, time, urllib.error, urllib.parse, urllib.request
+import json, re, subprocess, sys, time, urllib.parse
 
 PRODUCT_URL = "https://www.ulta.com/p/double-wear-stay-in-place-longwear-matte-foundation-pimprod2057355?sku=2651970"   # any /p/... URL from block 1 or 2
 UA = "browser-harness/1.0 (ulta domain skill; plain urllib)"
 
+FETCH_CHILD = r"""
+import gzip, json, sys, urllib.error, urllib.request
+url, ua = sys.argv[1], sys.argv[2]
+req = urllib.request.Request(url, headers={"User-Agent": ua, "Accept": "text/html", "Accept-Encoding": "gzip"})
+try:
+    with urllib.request.urlopen(req) as r:
+        status, final, body, enc = r.status, r.geturl(), r.read(), r.headers.get("Content-Encoding")
+except urllib.error.HTTPError as e:
+    status, final, body, enc = e.code, e.geturl() or url, b"", None
+if enc == "gzip":
+    body = gzip.decompress(body)
+sys.stdout.buffer.write(json.dumps({"status": status, "url": final}).encode() + b"\n" + body)
+"""
+
 def get_once(url, budget):
-    """Same as block 1: one GET in a daemon thread, the whole request and body read bounded by `budget` s."""
-    box = {}
-    def work():
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "text/html", "Accept-Encoding": "gzip"})
-            with urllib.request.urlopen(req, timeout=budget) as r:
-                body = r.read()
-                if r.headers.get("Content-Encoding") == "gzip":
-                    body = gzip.decompress(body)
-                box["ok"] = (r.geturl(), body)
-        except BaseException as e:
-            box["err"] = e
-    t = threading.Thread(target=work, daemon=True)
-    t.start()
-    t.join(budget)
-    if t.is_alive():
-        raise TimeoutError(f"no complete response within {budget:.1f} s (request abandoned)")
-    if "err" in box:
-        raise box["err"]
-    return box["ok"]
+    """Same as block 1: one GET in a child process killed at `budget` s, so nothing outlives the call."""
+    try:
+        p = subprocess.run([sys.executable, "-I", "-c", FETCH_CHILD, url, UA], capture_output=True, timeout=budget)
+    except subprocess.TimeoutExpired:
+        raise TimeoutError(f"no complete response within {budget:.1f} s (request process killed)")
+    if p.returncode != 0:
+        raise ConnectionError((p.stderr.decode(errors="replace").strip().splitlines() or ["fetch failed"])[-1])
+    head, _, body = p.stdout.partition(b"\n")
+    meta = json.loads(head)
+    return meta["status"], meta["url"], body
 
 def fetch(url, deadline_s=120):
     """Same retry policy as block 1: one monotonic deadline across all tries and waits, no sleep after the last."""
     end, waits = time.monotonic() + deadline_s, [5, 15, 30]
     for attempt in range(len(waits) + 1):
         try:
-            final_url, body = get_once(url, min(30, end - time.monotonic()))
-            got, want = urllib.parse.urlsplit(final_url), urllib.parse.urlsplit(url)
-            if got.path != want.path or (want.query and urllib.parse.parse_qs(got.query) != urllib.parse.parse_qs(want.query)):
-                raise RuntimeError(f"asked for {url}, was redirected to {final_url}")
-            return body.decode("utf-8")
-        except urllib.error.HTTPError as e:
-            if e.code in (403, 429):
-                raise SystemExit(f"HTTP {e.code} on {url}: Ulta is refusing or rate-limiting. Stop and back off.")
-            if e.code < 500:
-                raise RuntimeError(f"HTTP {e.code} on {url}")
-            err = f"HTTP {e.code}"
-        except (urllib.error.URLError, TimeoutError) as e:
+            status, final_url, body = get_once(url, min(30, end - time.monotonic()))
+        except (ConnectionError, TimeoutError) as e:
             err = repr(e)
+        else:
+            if status in (403, 429):
+                raise SystemExit(f"HTTP {status} on {url}: Ulta is refusing or rate-limiting. Stop and back off.")
+            if 400 <= status < 500:
+                raise RuntimeError(f"HTTP {status} on {url}")
+            if status < 400:
+                got, want = urllib.parse.urlsplit(final_url), urllib.parse.urlsplit(url)
+                if got.path != want.path or (want.query and urllib.parse.parse_qs(got.query) != urllib.parse.parse_qs(want.query)):
+                    raise RuntimeError(f"asked for {url}, was redirected to {final_url}")
+                return body.decode("utf-8")
+            err = f"HTTP {status}"
         if attempt == len(waits) or time.monotonic() + waits[attempt] >= end:
             raise RuntimeError(f"giving up on {url} after {attempt + 1} tries: {err}")
         time.sleep(waits[attempt])
@@ -561,7 +571,7 @@ Block 3 refuses partial pages: it raises when the Product JSON-LD lacks `product
 - **Listing vs landing pages.** Top-level department URLs such as `/shop/skin-care` returned 200 but have no `ProductListingResults` module; block 1 raises and points you at the sitemap. Leaf categories (`/shop/makeup/face/foundation`) and `/brand/<slug>` pages have it.
 - **Sort and filter params are not server-rendered.** `/shop/makeup/face/foundation?sort=price_low_to_high` returned 200 but without the listing module. Block 1 therefore accepts only bare listing URLs and pages with `?page=N`; sort the rows yourself.
 - **Review counts drift between surfaces.** The same product showed 10236 reviews on the listing and 10242 on its product page within minutes (the listing data is cached). Use block 3 when the exact count matters.
-- **Search pages carry sponsored cards.** Pages 1 and 2 of "mascara" usually had 13 to 15 cards tagged "Sponsored" mixed into the grid (74 and 75 cards total), page 3 had none; in the last run only page 1 had them (15 of 77), page 2 had 64 organic cards. Block 2 drops them by default (`SKIP_SPONSORED`). Listing pages fetched over HTTP had `sponsored: false` on every item observed.
+- **Search pages carry sponsored cards.** Pages 1 and 2 of "mascara" usually had 13 to 15 cards tagged "Sponsored" mixed into the grid (74 and 75 cards total), page 3 had none; in the last two runs only page 1 had them (15 of 77, then 15 of 76), page 2 had 64 organic cards. Block 2 drops them by default (`SKIP_SPONSORED`). Listing pages fetched over HTTP had `sponsored: false` on every item observed.
 - **Search redirects.** A brand-name query (`nars`) redirected to `/brand/nars`; a query with no matches redirected to `/search/no-results?search=...`. Block 2 checks `location.href` after every navigation and handles both. Multi-word queries are encoded with `urlencode` (`cushion+foundation`), which is also what the page shows in `location.href`.
 - **Product IDs come in several shapes:** `pimprod2057355`, `xlsImpprod5770257`, `VP11362`, `mkt77008704` (marketplace sellers) and plain digits (`2641`). Do not filter on a `pimprod` prefix.
 - **Unrated items.** 27 of 254 Foundation rows had no rating; search cards for unrated items have no ratings label, so `rating` and `review_count` are `None`.
@@ -569,7 +579,7 @@ Block 3 refuses partial pages: it raises when the Product JSON-LD lacks `product
 - **Region.** Ulta is a US storefront. Every load in this run, from the cloud browser and from plain HTTP, stayed on `https://www.ulta.com/` with no geo redirect, `lang="en-US"`, prices in `$` and JSON-LD `priceCurrency` `USD`; no country or region selector was found on the search page. Behavior from non-US locations was not tested.
 - **Consent banner.** In the browser a OneTrust cookie banner (`#onetrust-banner-sdk`, visible, about 88 px tall) rendered on load. It did not block reading the cards, so block 2 never clicks it. Plain HTTP responses are unaffected.
 - **Lazy loading.** Search cards were all in the DOM once the first ones appeared; scrolling the page did not change the card count (74 before and after on page 1). Images inside cards use `loading="lazy"`, which does not affect the fields above.
-- **Pacing.** None of the roughly 40 plain GETs and 25 browser page loads in this session (mostly 2 to 3 s apart) drew a 403, 429 or challenge page, so no rate limit was observed; that is not a promise of headroom. The 2026-10-24 reruns (25 plain GETs and 9 browser page loads) also drew none. The blocks sleep 3 s between pages and stop on 403/429 instead of retrying. HTTP retries share one 120 s monotonic deadline per URL: each try runs in a watchdog thread capped at min(30 s, time left), so connect, headers and the whole body read stop at the deadline even if a server trickles bytes, and there is no sleep after the last try. Mocked on localhost against both `fetch` copies: a refused port gave up after 4 tries and 50.1 s; a server sending 1 byte every 0.5 s gave up after 3 tries at 110.0 s (default deadline), and after 1 try at 12.0 s with `deadline_s=12`.
+- **Pacing.** None of the roughly 40 plain GETs and 25 browser page loads in this session (mostly 2 to 3 s apart) drew a 403, 429 or challenge page, so no rate limit was observed; that is not a promise of headroom. The 2026-10-24 reruns (32 plain GETs and 12 browser page loads) also drew none. The blocks sleep 3 s between pages and stop on 403/429 instead of retrying. HTTP retries share one 120 s monotonic deadline per URL: each try is a child Python process (`sys.executable -I -c FETCH_CHILD`) that is killed at min(30 s, time left), so DNS, connect, headers and the whole body read stop at the deadline even if a server trickles bytes, the socket closes with the process, and there is no sleep after the last try. An earlier version ran each try in a thread and only stopped waiting for it; against a trickling mock that left 2 abandoned requests still open after `fetch` raised. Mocked on localhost against both `fetch` copies of the current version: a refused port gave up after 4 tries and 50.7 s; a server sending 1 byte every 0.5 s gave up after 3 tries at 110.0 s (default deadline), and after 1 try at 12.0 s with `deadline_s=12`, for a trickled body and for trickled headers alike; after each of those, 0 child processes, 0 open server-side connections and 0 extra threads remained. A 503 was retried, a 404 raised, a 429 stopped, and a redirect to another path raised.
 - **Page size.** Listing pages are 64 items; the last page holds the remainder and has `loadMoreUrl: null`. A page past the end (`?page=5` on a 4-page category) returned 200 with 0 items.
 
 ## What does not work

@@ -9,7 +9,7 @@ robots.txt (fetched 2026-10-24) disallows `/jobs?q*`, `/jobsearch/` and `/job` f
 - Search result pages are server-rendered Next.js (App Router). Every page embeds the full result set as JSON inside `self.__next_f.push([1,"..."])` script strings, under a `"jobList":` key: `data` (20 jobs) + `meta` (`currentPage`, `pageCount`, `totalResults`, facets).
 - Plain HTTP works: a truthful custom User-Agent got HTTP 200 and the full JSON on every request in these runs (about 100 page requests, mostly at a 2 s pace, no 429, no challenge, no consent banner).
 - Page size is fixed at 20. Pages past 25 are clamped: `?page=26` and `?page=46` both returned `currentPage: 25`. So one search yields at most 500 jobs even when `pageCount` says 46. Treat that as a hard stop.
-- Relevance order is not stable between requests, so deep pagination repeats and skips some jobs (78-99 unique per 100 slots measured). De-dup on `guid`, and the helpers below return `status: "partial"` with a reason whenever fewer than `totalResults` jobs were collected or `totalResults` changed between pages.
+- Relevance order is not stable between requests, so deep pagination repeats and skips some jobs (78-99 unique per 100 slots measured). De-dup on `guid`, and the helpers below return `status: "partial"` with a reason whenever fewer than `totalResults` jobs were collected or `totalResults` changed between pages. They never return `"complete"`: Dice serves no stable snapshot, so the best case is `status: "count_matched"` (unique jobs reached a steady `totalResults`), which is still not proof that every posting was seen.
 - `/job-detail/<guid>` pages carry a schema.org `JobPosting` JSON-LD block (full description, `validThrough`, postal address).
 - The browser path works too (same JSON, read from the inline scripts), but it is not needed for logged-out search.
 
@@ -31,6 +31,7 @@ DELAYS = (5, 15, 40)   # backoff between attempts, never after the last one
 CHALLENGE = re.compile(r"cf-chl|/cdn-cgi/challenge-platform|px-captcha|captcha-delivery\.com|"
                        r"_Incapsula_Resource|g-recaptcha|h-captcha|"
                        r"<title>\s*(?:Access Denied|Just a moment|Attention Required)", re.I)
+UNVERIFIED = "unique jobs reached totalResults, but Dice has no stable snapshot: not verified complete"
 
 def search_url(keyword=None, location=None, page=1, filters=None):
     """Public search path /jobs/q-<kw>-l-<loc>-jobs. Hyphens are path separators
@@ -119,9 +120,11 @@ def normalize(j):
     }
 
 def search_dice(keyword=None, location=None, max_pages=3, filters=None):
-    """Returns (jobs, info). info["status"] is "complete" only when totalResults
-    stayed the same on every page and at least that many unique jobs were
-    collected; otherwise "partial" with a reason."""
+    """Returns (jobs, info). info["status"] is never "complete": Dice serves no
+    stable snapshot, so a matching count does not prove every job was seen.
+    "count_matched" = every requested page came back as asked, totalResults stayed
+    the same on every page and at least that many unique jobs were collected
+    (still unverified, see reason); otherwise "partial" with a reason."""
     if max_pages < 1:
         raise ValueError("max_pages must be >= 1")
     jobs, seen, meta, reason, totals, counts = [], set(), {}, None, [], []
@@ -144,8 +147,11 @@ def search_dice(keyword=None, location=None, max_pages=3, filters=None):
     fetched = page if reason is None else page - 1
     # Largest count seen, so a total that shrank mid-crawl cannot make a short crawl look complete.
     total, pages = max(totals), max(counts)
-    if len(jobs) >= total and min(totals) == total:
-        status, reason = "complete", None
+    # A failed pagination step (reason already set) is always partial, whatever the count says.
+    if reason is None and len(jobs) >= total and min(totals) == total:
+        # Order reshuffles and postings can swap without changing the count,
+        # so a matching count is the best signal available, not proof.
+        status, reason = "count_matched", UNVERIFIED
     else:
         status = "partial"
         if reason is None and pages > fetched:
@@ -166,6 +172,10 @@ for r in jobs[:3]:
 remote, rinfo = search_dice("DevOps Engineer", max_pages=2,
                             filters={"filters.workplaceTypes": "Remote"})
 print("remote devops:", rinfo)
+
+# Small search, every page: the best case is "count_matched", never "complete".
+full, finfo = search_dice("Python Developer", "Houston, TX", max_pages=30)
+print("houston all pages:", finfo)
 ```
 
 Output observed (trimmed):
@@ -174,11 +184,12 @@ Output observed (trimmed):
 {'status': 'partial', 'reason': 'max_pages=3 reached', 'total': 132, 'page_count': 7, 'pages_fetched': 3, 'collected': 60}
 {"title": "Python Developer - Houston, TX (Locals only)", "company": "Source Mantra Inc", "location": "Houston, Texas, USA", "workplace": "On-Site", "employment_type": "Third Party, Contract", "posted": "2026-10-23T19:05:49Z", "salary": "$$65 - $70", "url": "https://www.dice.com/job-detail/7a92a6a3-2b6f-49be-9f2a-c6737ea95e2e", "guid": "7a92a6a3-2b6f-49be-9f2a-c6737ea95e2e"}
 {"title": "Python Developer", "company": "Mindlance", "location": "Houston, Texas, USA", "workplace": "On-Site", "employment_type": "Contract", "posted": "2026-10-15T21:57:49Z", "salary": "50 - 58", ...}
-{"title": "Senior AWS Python Developer / Ops Engineer", "company": "EPAM Systems", "location": null, "workplace": "Remote", "employment_type": "Full-time", ...}
-remote devops: {'status': 'partial', 'reason': 'max_pages=2 reached', 'total': 239, 'page_count': 12, 'pages_fetched': 2, 'collected': 40}
+{"title": "Python Developer - AWS, AI, LLM -  ZL", "company": "SES", "location": null, "workplace": "Remote", "employment_type": "Full-time", ...}
+remote devops: {'status': 'partial', 'reason': 'max_pages=2 reached', 'total': 239, 'page_count': 12, 'pages_fetched': 2, 'collected': 39}
+houston all pages: {'status': 'count_matched', 'reason': 'unique jobs reached totalResults, but Dice has no stable snapshot: not verified complete', 'total': 132, 'page_count': 7, 'pages_fetched': 7, 'collected': 132}
 ```
 
-`collected` for the remote DevOps search was 40 on this run and 39 on an earlier 2026-10-24 run, where page 2 repeated one page-1 job. With `max_pages=30` the same Houston search fetched all 7 pages and stopped at `pageCount`: 132 of 132 jobs on 2026-10-23 and on the last 2026-10-24 run (`status: "complete"`, `totalResults` 132 on every page), 131 of 132 on an earlier 2026-10-24 run (returned as `status: "partial"`, reason `relevance order reshuffled between pages`). Never report a `partial` result as the full set.
+`collected` for the remote DevOps search was 39 on this run and 38, 39 and 40 on earlier 2026-10-24 runs, because page 2 repeats some page-1 jobs. The Houston `max_pages=30` search fetched all 7 pages and stopped at `pageCount`: 132 of 132 unique jobs on this run and on 2026-10-23, 131 of 132 on an earlier 2026-10-24 run (returned as `status: "partial"`, reason `relevance order reshuffled between pages`). Never report a `partial` result as the full set, and present `count_matched` as "count reached, not verified complete".
 
 URL shapes that returned 200 with a `jobList`:
 
@@ -272,9 +283,11 @@ def browser_search(keyword=None, location=None, max_pages=2):
                          "posted": j.get("postedDate"), "url": j["detailsPageUrl"]})
         if page >= meta["pageCount"]:
             break
-    total, pages = max(totals), max(counts)   # largest seen: a shrinking total cannot fake "complete"
-    if len(rows) >= total and min(totals) == total:
-        status, reason = "complete", None
+    total, pages = max(totals), max(counts)   # largest seen: a shrinking total cannot fake a match
+    if reason is None and len(rows) >= total and min(totals) == total:   # page mismatch = partial
+        # Never "complete": order reshuffles and postings can swap without changing the count.
+        status = "count_matched"
+        reason = "unique jobs reached totalResults, but Dice has no stable snapshot: not verified complete"
     else:
         status = "partial"
         if reason is None and pages > page:
@@ -299,7 +312,7 @@ Output observed (trimmed):
 {"title": "DevOps Engineer", "company": "TechNix LLC", "location": "Raleigh, North Carolina, USA", "employment_type": "Contract, Third Party", ...}
 ```
 
-This run got all 40 slots unique, but across runs the same call collected 38, 28 (2026-10-23) and 35 (2026-10-24) unique jobs, because the relevance order reshuffles between requests and page 2 repeats some page-1 jobs. See "Unstable order" under Gotchas.
+This run got 40 unique jobs out of 40 slots; across runs the same call collected 38 and 28 (2026-10-23) and 35, 39 and 40 (2026-10-24), because the relevance order reshuffles between requests and page 2 repeats some page-1 jobs. See "Unstable order" under Gotchas.
 
 DOM fallback if the JSON ever disappears: each result is `[data-testid="job-card"][role="article"]` inside `role="list"` with `aria-label="Job search results"`; the card link `a[data-testid="job-search-job-card-link"]` has `href="/job-detail/<guid>"` and `aria-label="View Details for <title> (<id>)"`. Card text only has relative dates ("Yesterday", "2d ago"), so prefer the JSON.
 
@@ -411,10 +424,10 @@ JSON-LD keys seen: `title, datePosted, validThrough, employmentType, hiringOrgan
 - URL-encode with `quote_plus`: `C#` must be `C%23` (`/jobs/q-C%23+Developer-jobs` worked), commas become `%2C`.
 - 25-page clamp: any `page` above 25 silently returns page 25, so compare `meta.currentPage` to the page you asked for. `pageCount` can exceed 25 (46 for "Python Developer"); 500 jobs is the per-search ceiling. Treat it as a hard stop (`search_dice` returns `status: "partial"`, reason `Dice 25-page cap`); do not split one search into many slices or reshape the query to get around it.
 - `pageSize` query param is ignored; always 20 per page. `page=0` returns page 1.
-- Unstable order: results are always sorted by `relevance` and the order reshuffles between requests, so consecutive pages repeat some jobs and skip others. Unique jobs over pages 1-5 (100 slots) measured on 2026-10-23: "Python Developer" 99, "Data Engineer" in Chicago 91, "DevOps Engineer" 89, "DevOps Engineer" + `l-Remote` 78. Reloading the same page 2 returned only 8 of the same 20 jobs. Small result sets came back nearly or fully complete (Houston "Python Developer": 132 of 132 over 7 pages on 2026-10-23, 131 of 132 on 2026-10-24). `sortBy=date`, `sort=date`, `sortBy=postedDate` were all ignored (`meta.sortBy` stayed `relevance`). Always de-dup on `guid` and report `len(jobs)` against `totalResults` instead of assuming full coverage.
+- Unstable order: results are always sorted by `relevance` and the order reshuffles between requests, so consecutive pages repeat some jobs and skip others. Unique jobs over pages 1-5 (100 slots) measured on 2026-10-23: "Python Developer" 99, "Data Engineer" in Chicago 91, "DevOps Engineer" 89, "DevOps Engineer" + `l-Remote` 78. Reloading the same page 2 returned only 8 of the same 20 jobs. Small result sets came back at or near the full count (Houston "Python Developer": 132 of 132 over 7 pages on 2026-10-23 and in the latest 2026-10-24 run, 131 of 132 in an earlier 2026-10-24 run). `sortBy=date`, `sort=date`, `sortBy=postedDate` were all ignored (`meta.sortBy` stayed `relevance`). Always de-dup on `guid` and report `len(jobs)` against `totalResults` instead of assuming full coverage.
 - The same title can be posted twice under different `guid`s (seen for one recruiter); those are separate postings, keep both.
 - `l-Remote` does not filter to remote jobs (top hits were On-Site); use `filters.workplaceTypes=Remote`.
-- Counts drift between requests (918 vs 919 total within minutes) because postings update continuously. Both search helpers keep the largest `totalResults` seen and return `status: "partial"` (reason `totalResults changed during the crawl`) when it changed between pages, so a shrinking count never turns a short crawl into "complete".
+- Counts drift between requests (918 vs 919 total within minutes) because postings update continuously. Both search helpers keep the largest `totalResults` seen and return `status: "partial"` (reason `totalResults changed during the crawl`) when it changed between pages, so a shrinking count never turns a short crawl into a match. A steady count does not prove a steady set either (one posting can close as another opens), which is why the best status is `count_matched`, not `complete`.
 - No cookie/consent banner appeared on these pages in the cloud browser (US). No region redirect seen.
 - Polite pacing: 2 s between pages was used for the whole run without any 429. `fetch` retries 429/5xx and network errors only inside one 120 s deadline; a 403, a challenge page or a page without `jobList` raises at once. Stop there and tell the user; do not retry around it or change the User-Agent.
 
